@@ -34,10 +34,19 @@ def parse_args():
                    help="GT image downscale factor (0.5 = half-res, faster)")
     p.add_argument("--tex_res",     type=int,   default=1024,
                    help="Target output texture long side (aspect ratio preserved from input texture when available)")
+    p.add_argument("--progressive_tex", action="store_true",
+                   help="Use progressive texture upscaling during training (1/4 -> 1/2 -> full)")
     p.add_argument("--lr_tex",      type=float, default=1e-3,
                    help="Texture learning rate")
     p.add_argument("--lr_ppisp",    type=float, default=5e-3,
                    help="PPISP learning rate")
+    p.add_argument("--l1_weight", type=float, default=0.8,
+                   help="Photometric L1 weight")
+    p.add_argument("--ssim_weight", type=float, default=0.2,
+                   help="Photometric SSIM weight")
+    p.add_argument("--ssim_backend", type=str, default="auto",
+                   choices=["auto", "native", "msssim"],
+                   help="SSIM backend: auto (prefer pytorch_msssim), native, or msssim")
     p.add_argument("--lr_geom",     type=float, default=1e-4,
                    help="Geometry (vertex offsets) learning rate")
     p.add_argument("--warmup",      type=int,   default=500,
@@ -100,6 +109,10 @@ def main():
         cfg.warmup_iters    = min(50, args.iters // 10)
         cfg.lr_texture      = args.lr_tex
         cfg.lr_ppisp        = args.lr_ppisp
+        cfg.progressive_texture = args.progressive_tex
+        cfg.l1_weight       = args.l1_weight
+        cfg.ssim_weight     = args.ssim_weight
+        cfg.ssim_backend    = args.ssim_backend
         cfg.lr_geometry     = args.lr_geom
         cfg.learn_vignette  = not args.no_vignette
         cfg.learn_geometry  = args.learn_geometry
@@ -158,6 +171,10 @@ def main():
     cfg.warmup_iters    = args.warmup
     cfg.lr_texture      = args.lr_tex
     cfg.lr_ppisp        = args.lr_ppisp
+    cfg.progressive_texture = args.progressive_tex
+    cfg.l1_weight       = args.l1_weight
+    cfg.ssim_weight     = args.ssim_weight
+    cfg.ssim_backend    = args.ssim_backend
     cfg.lr_geometry     = args.lr_geom
     cfg.learn_vignette  = not args.no_vignette
     cfg.learn_geometry  = args.learn_geometry

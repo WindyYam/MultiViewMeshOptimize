@@ -16,6 +16,7 @@ from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from PIL import Image
 import numpy as np
@@ -43,9 +44,13 @@ class TrainConfig:
     photo_weight:     float = 1.0
     tex_reg_weight:   float = 5e-5
     ppisp_reg_weight: float = 1e-2
+    l1_weight:        float = 0.8
+    ssim_weight:      float = 0.2
+    ssim_backend:     str   = "auto"   # auto, native, msssim
 
     tex_H:            int   = 1024
     tex_W:            int   = 1024
+    progressive_texture: bool = False
 
     log_every:        int   = 50
     save_every:       int   = 500
@@ -131,8 +136,15 @@ class TexturePPISPTrainer:
             self._vertex_degree = None
 
         # ---- Texture ----
+        self._full_tex_H = int(config.tex_H)
+        self._full_tex_W = int(config.tex_W)
+        self._tex_stage_scales = (0.25, 0.5, 1.0)
+        self._tex_stage_iters = self._build_tex_stage_iters(config.num_iterations)
+        self._tex_stage = self._texture_stage_for_iter(0)
+        init_tex_h, init_tex_w = self._stage_texture_resolution(self._tex_stage)
+
         self.texture = TextureMap(
-            config.tex_H, config.tex_W,
+            init_tex_h, init_tex_w,
             init_image=scene.mesh.tex_image,
         ).to(self.device)
 
@@ -165,12 +177,13 @@ class TexturePPISPTrainer:
             photo_weight=config.photo_weight,
             tex_reg_weight=config.tex_reg_weight,
             ppisp_reg_weight=config.ppisp_reg_weight,
+            l1_weight=config.l1_weight,
+            ssim_weight=config.ssim_weight,
+            ssim_backend=config.ssim_backend,
         )
 
         # ---- Optimizers ----
-        self.opt_tex   = optim.Adam(self.texture.parameters(),
-                                    lr=config.lr_texture,
-                                    betas=(0.9, 0.99), eps=1e-15)
+        self.opt_tex   = self._create_tex_optimizer()
         self.opt_ppisp = optim.Adam(self.ppisp.parameters(),
                                     lr=config.lr_ppisp)
         self.opt_geom  = (optim.Adam([self.geometry_offsets], lr=config.lr_geometry)
@@ -194,7 +207,7 @@ class TexturePPISPTrainer:
         print(f"[Trainer] Backend   : {'nvdiffrast' if self.rasterizer.uses_nvdiffrast else 'software (SLOW)'}")
         print(f"[Trainer] Cameras   : {len(scene)}")
         print(f"[Trainer] Mesh      : {self.base_vertices.shape[0]:,} verts, {self.faces.shape[0]:,} faces")
-        print(f"[Trainer] Texture   : {config.tex_H}×{config.tex_W}  ({n_tex/1e6:.1f}M params)")
+        print(f"[Trainer] Texture   : {init_tex_h}×{init_tex_w} -> {self._full_tex_H}×{self._full_tex_W}  ({n_tex/1e6:.1f}M params)")
         print(f"[Trainer] PPISP     : {n_ppisp} params  ({len(scene)} cameras)")
         print(
             f"[Trainer] Geometry  : {'on' if self.learn_geometry else 'off'}"
@@ -210,7 +223,72 @@ class TexturePPISPTrainer:
             f"{f' ({config.amp_dtype})' if self._amp_enabled else ''}"
         )
         print(f"[Trainer] TF32      : {'on' if (self.device.type == 'cuda' and config.use_tf32) else 'off'}")
+        print(f"[Trainer] PhotoLoss : L1={config.l1_weight:.2f}, SSIM={config.ssim_weight:.2f} ({config.ssim_backend})")
+        if config.progressive_texture:
+            print(
+                "[Trainer] TexProg   : on"
+                f"  1/4 until iter<{self._tex_stage_iters[0]},"
+                f" 1/2 until iter<{self._tex_stage_iters[1]}, full after"
+            )
+        else:
+            print("[Trainer] TexProg   : off")
         print(f"[Trainer] Iterations: {config.num_iterations}")
+
+    def _create_tex_optimizer(self):
+        return optim.Adam(
+            self.texture.parameters(),
+            lr=self.cfg.lr_texture,
+            betas=(0.9, 0.99),
+            eps=1e-15,
+        )
+
+    def _build_tex_stage_iters(self, total_iters: int):
+        if total_iters <= 2:
+            return (1, 2)
+        t1 = max(1, total_iters // 3)
+        t2 = max(t1 + 1, (2 * total_iters) // 3)
+        return (t1, t2)
+
+    def _stage_texture_resolution(self, stage: int):
+        scale = self._tex_stage_scales[max(0, min(stage, len(self._tex_stage_scales) - 1))]
+        h = max(1, int(round(self._full_tex_H * scale)))
+        w = max(1, int(round(self._full_tex_W * scale)))
+        return h, w
+
+    def _texture_stage_for_iter(self, iteration: int) -> int:
+        if not self.cfg.progressive_texture:
+            return len(self._tex_stage_scales) - 1
+        if iteration < self._tex_stage_iters[0]:
+            return 0
+        if iteration < self._tex_stage_iters[1]:
+            return 1
+        return 2
+
+    def _set_texture_stage(self, stage: int):
+        target_h, target_w = self._stage_texture_resolution(stage)
+        cur_h = int(self.texture.tex.shape[2])
+        cur_w = int(self.texture.tex.shape[3])
+        if cur_h == target_h and cur_w == target_w:
+            self._tex_stage = stage
+            return
+
+        with torch.no_grad():
+            tex_now = self.texture.tex.detach()
+            tex_up = F.interpolate(
+                tex_now,
+                size=(target_h, target_w),
+                mode="bilinear",
+                align_corners=False,
+            )
+        self.texture.tex = nn.Parameter(tex_up)
+        self.opt_tex = self._create_tex_optimizer()
+        self._tex_stage = stage
+        print(f"[Trainer] Texture upscale -> {target_h}x{target_w} (stage {stage+1}/3)")
+
+    def _maybe_update_texture_stage(self):
+        target_stage = self._texture_stage_for_iter(self.iter)
+        if target_stage != self._tex_stage:
+            self._set_texture_stage(target_stage)
 
     def _configure_acceleration(self):
         cfg = self.cfg
@@ -620,6 +698,7 @@ class TexturePPISPTrainer:
         t_iter  = time.time()
 
         for self.iter in range(cfg.num_iterations):
+            self._maybe_update_texture_stage()
             view   = random.choice(views)
             losses = self.step(view)
             self._update_lr()
@@ -680,6 +759,7 @@ class TexturePPISPTrainer:
             "ppisp":      self.ppisp.state_dict(),
             "opt_tex":    self.opt_tex.state_dict(),
             "opt_ppisp":  self.opt_ppisp.state_dict(),
+            "tex_stage":  int(self._tex_stage),
             "vertex_offsets": self.geometry_offsets.detach().cpu() if self.learn_geometry else None,
             "geometry_offsets": self.geometry_offsets.detach().cpu() if self.learn_geometry else None,
             "weld_enabled": self._weld_enabled,
@@ -708,10 +788,30 @@ class TexturePPISPTrainer:
 
     def load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
+
+        tex_blob = ckpt["texture"].get("tex", None)
+        if tex_blob is not None:
+            tex_h = int(tex_blob.shape[2])
+            tex_w = int(tex_blob.shape[3])
+            cur_h = int(self.texture.tex.shape[2])
+            cur_w = int(self.texture.tex.shape[3])
+            if (tex_h, tex_w) != (cur_h, cur_w):
+                self._set_texture_stage(2)
+                with torch.no_grad():
+                    resized = F.interpolate(
+                        self.texture.tex.detach(),
+                        size=(tex_h, tex_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                self.texture.tex = nn.Parameter(resized)
+                self.opt_tex = self._create_tex_optimizer()
+
         self.texture.load_state_dict(ckpt["texture"])
         self.ppisp.load_state_dict(ckpt["ppisp"])
         self.opt_tex.load_state_dict(ckpt["opt_tex"])
         self.opt_ppisp.load_state_dict(ckpt["opt_ppisp"])
+        self._tex_stage = int(ckpt.get("tex_stage", self._texture_stage_for_iter(int(ckpt["iteration"]))))
         if self.learn_geometry:
             geom_blob = ckpt.get("geometry_offsets", ckpt.get("vertex_offsets"))
             if geom_blob is not None:

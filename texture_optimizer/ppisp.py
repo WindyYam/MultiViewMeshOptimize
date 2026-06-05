@@ -119,13 +119,13 @@ class PPISPParams(nn.Module):
         """
         x = rendered.float()                              # (H, W, 3)
 
-        # 1) Exposure
-        exp = self.exposure()[cam_idx]                    # scalar
-        x = x * exp
+        # Compute only the active camera's scalar params to avoid
+        # repeatedly evaluating exp/softplus for all cameras each step.
+        exp = torch.exp(self.log_exposure[cam_idx])
+        wb = torch.exp(self.log_wb[cam_idx])
 
-        # 2) White balance  (channel-wise)
-        wb = self.wb_gains()[cam_idx]                     # (3,)
-        x = x * wb.view(1, 1, 3)
+        # 1) Exposure + 2) White balance (combined scale)
+        x = x * exp * wb.view(1, 1, 3)
 
         # 3) Vignette (optional)
         if self.learn_vignette:
@@ -134,12 +134,12 @@ class PPISPParams(nn.Module):
             x = x * vign.unsqueeze(-1)
 
         # 4) Gamma compression  (safe power via clamp+eps)
-        g = self.gamma()[cam_idx]
+        g = F.softplus(self.gamma_raw[cam_idx]) + 0.5
         x = torch.clamp(x, min=1e-8)
         x = x ** (1.0 / g)
 
         # 5) Brightness + Contrast (applied in [0,1] space)
-        c = self.contrast()[cam_idx]
+        c = F.softplus(self.log_contrast[cam_idx]) + 0.5
         b = self.brightness[cam_idx]
         x = c * (x - 0.5) + 0.5 + b
 
