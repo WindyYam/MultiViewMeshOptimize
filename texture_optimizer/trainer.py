@@ -12,6 +12,7 @@ Training loop:
 import os, math, time, random
 from pathlib import Path
 from typing import Optional, List, Callable
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -62,6 +63,9 @@ class TrainConfig:
     live_view_every:       int   = 50
     live_view_camera:      int   = 0
     live_view_max_size:    int   = 1200
+    use_amp:               bool  = False
+    amp_dtype:             str   = "fp16"   # fp16 or bf16
+    use_tf32:              bool  = True
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +82,11 @@ class TexturePPISPTrainer:
         torch.manual_seed(config.seed)
         random.seed(config.seed)
         Path(config.output_dir).mkdir(parents=True, exist_ok=True)
+
+        self._amp_enabled = False
+        self._amp_dtype = None
+        self._grad_scaler = None
+        self._configure_acceleration()
 
         # ---- Mesh ----
         self.base_vertices = scene.mesh.vertices.to(self.device)
@@ -167,7 +176,41 @@ class TexturePPISPTrainer:
         print(f"[Trainer] PPISP     : {n_ppisp} params  ({len(scene)} cameras)")
         print(f"[Trainer] Geometry  : {'on' if self.learn_geometry else 'off'}"
               f"{f'  ({n_geom/1e6:.1f}M offset params)' if self.learn_geometry else ''}")
+        print(f"[Trainer] AMP       : {'on' if self._amp_enabled else 'off'}"
+              f"{f' ({config.amp_dtype})' if self._amp_enabled else ''}")
+        print(f"[Trainer] TF32      : {'on' if (self.device.type == 'cuda' and config.use_tf32) else 'off'}")
         print(f"[Trainer] Iterations: {config.num_iterations}")
+
+    def _configure_acceleration(self):
+        cfg = self.cfg
+        if self.device.type == "cuda" and bool(cfg.use_tf32):
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                torch.backends.cudnn.benchmark = True
+                if hasattr(torch, "set_float32_matmul_precision"):
+                    torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
+
+        if self.device.type != "cuda" or not bool(cfg.use_amp):
+            return
+
+        amp_mode = str(cfg.amp_dtype).lower()
+        if amp_mode == "bf16":
+            self._amp_dtype = torch.bfloat16
+            self._amp_enabled = True
+            # bf16 typically does not require gradient scaling.
+            self._grad_scaler = None
+        else:
+            self._amp_dtype = torch.float16
+            self._amp_enabled = True
+            self._grad_scaler = torch.cuda.amp.GradScaler(enabled=True)
+
+    def _autocast_ctx(self):
+        if not self._amp_enabled or self.device.type != "cuda":
+            return nullcontext()
+        return torch.autocast(device_type="cuda", dtype=self._amp_dtype)
 
     def _init_live_viewer(self):
         cfg = self.cfg
@@ -420,25 +463,45 @@ class TexturePPISPTrainer:
         train_geom = self.learn_geometry and (self.iter >= self.cfg.geometry_warmup_iters)
         self.vertex_offsets.requires_grad_(train_geom)
 
-        self.opt_tex.zero_grad()
-        self.opt_ppisp.zero_grad()
+        self.opt_tex.zero_grad(set_to_none=True)
+        self.opt_ppisp.zero_grad(set_to_none=True)
         if self.opt_geom is not None:
-            self.opt_geom.zero_grad()
+            self.opt_geom.zero_grad(set_to_none=True)
 
-        pred   = self.render_view(view)
-        losses = self.loss_fn(pred, gt, self.texture, self.ppisp)
-        geom_losses = self._geometry_regularization(self.current_vertices())
-        total = losses["total"] + geom_losses["geom_reg"]
-        total.backward()
+        with self._autocast_ctx():
+            pred   = self.render_view(view)
+            losses = self.loss_fn(pred, gt, self.texture, self.ppisp)
+            geom_losses = self._geometry_regularization(self.current_vertices())
+            total = losses["total"] + geom_losses["geom_reg"]
 
-        torch.nn.utils.clip_grad_norm_(self.ppisp.parameters(), 1.0)
-        if train_tex:
-            torch.nn.utils.clip_grad_norm_(self.texture.parameters(), 1.0)
-            self.opt_tex.step()
-        if train_geom and self.opt_geom is not None:
-            torch.nn.utils.clip_grad_norm_([self.vertex_offsets], 1.0)
-            self.opt_geom.step()
-        self.opt_ppisp.step()
+        if self._grad_scaler is not None:
+            self._grad_scaler.scale(total).backward()
+
+            self._grad_scaler.unscale_(self.opt_ppisp)
+            torch.nn.utils.clip_grad_norm_(self.ppisp.parameters(), 1.0)
+            if train_tex:
+                self._grad_scaler.unscale_(self.opt_tex)
+                torch.nn.utils.clip_grad_norm_(self.texture.parameters(), 1.0)
+            if train_geom and self.opt_geom is not None:
+                self._grad_scaler.unscale_(self.opt_geom)
+                torch.nn.utils.clip_grad_norm_([self.vertex_offsets], 1.0)
+
+            if train_tex:
+                self._grad_scaler.step(self.opt_tex)
+            if train_geom and self.opt_geom is not None:
+                self._grad_scaler.step(self.opt_geom)
+            self._grad_scaler.step(self.opt_ppisp)
+            self._grad_scaler.update()
+        else:
+            total.backward()
+            torch.nn.utils.clip_grad_norm_(self.ppisp.parameters(), 1.0)
+            if train_tex:
+                torch.nn.utils.clip_grad_norm_(self.texture.parameters(), 1.0)
+                self.opt_tex.step()
+            if train_geom and self.opt_geom is not None:
+                torch.nn.utils.clip_grad_norm_([self.vertex_offsets], 1.0)
+                self.opt_geom.step()
+            self.opt_ppisp.step()
 
         out = {
             "total": total,
@@ -539,6 +602,9 @@ class TexturePPISPTrainer:
             "opt_ppisp":  self.opt_ppisp.state_dict(),
             "vertex_offsets": self.vertex_offsets.detach().cpu() if self.learn_geometry else None,
             "opt_geom":   self.opt_geom.state_dict() if self.opt_geom is not None else None,
+            "amp_enabled": self._amp_enabled,
+            "amp_dtype": self.cfg.amp_dtype,
+            "grad_scaler": self._grad_scaler.state_dict() if self._grad_scaler is not None else None,
             "loss_log":   self.loss_log,
         }, path)
         # Keep only the most recent checkpoint file to limit disk usage.
@@ -568,6 +634,8 @@ class TexturePPISPTrainer:
                 self.vertex_offsets.copy_(ckpt["vertex_offsets"].to(self.device))
             if self.opt_geom is not None and ckpt.get("opt_geom") is not None:
                 self.opt_geom.load_state_dict(ckpt["opt_geom"])
+        if self._grad_scaler is not None and ckpt.get("grad_scaler") is not None:
+            self._grad_scaler.load_state_dict(ckpt["grad_scaler"])
         self.iter     = ckpt["iteration"]
         self.loss_log = ckpt.get("loss_log", [])
         print(f"[Trainer] Loaded checkpoint iter {self.iter}: {path}")

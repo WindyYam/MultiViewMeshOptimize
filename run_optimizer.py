@@ -30,10 +30,10 @@ def parse_args():
                    help="Output directory for texture, PPISP params, checkpoints")
     p.add_argument("--iters",       type=int,   default=5000,
                    help="Total training iterations")
-    p.add_argument("--scale",       type=float, default=0.5,
+    p.add_argument("--scale",       type=float, default=1,
                    help="GT image downscale factor (0.5 = half-res, faster)")
     p.add_argument("--tex_res",     type=int,   default=1024,
-                   help="Output texture resolution (square, e.g. 2048 or 8192)")
+                   help="Target output texture long side (aspect ratio preserved from input texture when available)")
     p.add_argument("--lr_tex",      type=float, default=1e-3,
                    help="Texture learning rate")
     p.add_argument("--lr_ppisp",    type=float, default=5e-3,
@@ -50,7 +50,7 @@ def parse_args():
                    help="L2 regularization weight on vertex displacements")
     p.add_argument("--geom_reg_edge", type=float, default=1e-2,
                    help="Edge-length preservation weight for geometry updates")
-    p.add_argument("--max_vertex_offset", type=float, default=0.03,
+    p.add_argument("--max_vertex_offset", type=float, default=1,
                    help="Max absolute vertex displacement (scene units); set <=0 to disable clamp")
     p.add_argument("--no_vignette", action="store_true",
                    help="Disable per-camera vignette learning")
@@ -68,6 +68,12 @@ def parse_args():
                    help="Initial camera index for live view")
     p.add_argument("--live_view_max_size", type=int, default=1200,
                    help="Max preview width/height in pixels for live window")
+    p.add_argument("--amp", action="store_true",
+                   help="Enable mixed precision acceleration on CUDA")
+    p.add_argument("--amp_dtype", type=str, default="bf16", choices=["fp16", "bf16"],
+                   help="AMP dtype to use when --amp is enabled")
+    p.add_argument("--no_tf32", action="store_true",
+                   help="Disable TF32 matmul/conv acceleration on CUDA")
     return p.parse_args()
 
 
@@ -106,6 +112,9 @@ def main():
         cfg.live_view_every = args.live_view_every
         cfg.live_view_camera = args.live_view_cam
         cfg.live_view_max_size = args.live_view_max_size
+        cfg.use_amp         = args.amp
+        cfg.amp_dtype       = args.amp_dtype
+        cfg.use_tf32        = not args.no_tf32
         cfg.device          = str(device)
         cfg.log_every       = max(1, args.iters // 30)
         cfg.save_every      = max(1, args.iters // 5)
@@ -134,7 +143,18 @@ def main():
     cfg = TrainConfig()
     cfg.num_iterations  = args.iters
     cfg.output_dir      = args.output
-    cfg.tex_H = cfg.tex_W = args.tex_res
+    if scene.mesh.tex_image is not None:
+        in_h = int(scene.mesh.tex_image.shape[0])
+        in_w = int(scene.mesh.tex_image.shape[1])
+        long_side = max(in_h, in_w)
+        if long_side > 0:
+            scale = float(args.tex_res) / float(long_side)
+            cfg.tex_H = max(1, int(round(in_h * scale)))
+            cfg.tex_W = max(1, int(round(in_w * scale)))
+        else:
+            cfg.tex_H = cfg.tex_W = args.tex_res
+    else:
+        cfg.tex_H = cfg.tex_W = args.tex_res
     cfg.warmup_iters    = args.warmup
     cfg.lr_texture      = args.lr_tex
     cfg.lr_ppisp        = args.lr_ppisp
@@ -150,6 +170,9 @@ def main():
     cfg.live_view_every = args.live_view_every
     cfg.live_view_camera = args.live_view_cam
     cfg.live_view_max_size = args.live_view_max_size
+    cfg.use_amp         = args.amp
+    cfg.amp_dtype       = args.amp_dtype
+    cfg.use_tf32        = not args.no_tf32
     cfg.device          = str(device)
 
     trainer = TexturePPISPTrainer(scene, cfg)
