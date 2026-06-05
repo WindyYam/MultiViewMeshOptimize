@@ -46,12 +46,14 @@ def parse_args():
                    help="Warmup iterations before geometry updates start")
     p.add_argument("--learn_geometry", action="store_true",
                    help="Enable differentiable mesh geometry updates")
-    p.add_argument("--geom_reg_l2",   type=float, default=1e-3,
+    p.add_argument("--geom_reg_l2",   type=float, default=1e-4,
                    help="L2 regularization weight on vertex displacements")
-    p.add_argument("--geom_reg_edge", type=float, default=1e-2,
+    p.add_argument("--geom_reg_edge", type=float, default=1e-4,
                    help="Edge-length preservation weight for geometry updates")
     p.add_argument("--max_vertex_offset", type=float, default=0,
                    help="Max absolute vertex displacement (scene units); set <=0 to disable clamp")
+    p.add_argument("--no_weld_geometry", action="store_true",
+                   help="Disable welding duplicate-position vertices for geometry optimization")
     p.add_argument("--no_vignette", action="store_true",
                    help="Disable per-camera vignette learning")
     p.add_argument("--resume",      type=str,   default=None,
@@ -108,6 +110,7 @@ def main():
         cfg.geom_reg_edge_weight  = args.geom_reg_edge
         cfg.max_vertex_offset     = (args.max_vertex_offset
                          if args.max_vertex_offset > 0 else None)
+        cfg.weld_geometry_vertices = not args.no_weld_geometry
         cfg.live_view       = args.live_view
         cfg.live_view_every = args.live_view_every
         cfg.live_view_camera = args.live_view_cam
@@ -166,6 +169,7 @@ def main():
     cfg.geom_reg_edge_weight  = args.geom_reg_edge
     cfg.max_vertex_offset     = (args.max_vertex_offset
                                  if args.max_vertex_offset > 0 else None)
+    cfg.weld_geometry_vertices = not args.no_weld_geometry
     cfg.live_view       = args.live_view
     cfg.live_view_every = args.live_view_every
     cfg.live_view_camera = args.live_view_cam

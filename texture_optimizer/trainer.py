@@ -59,6 +59,8 @@ class TrainConfig:
     geom_reg_l2_weight:    float = 1e-3
     geom_reg_edge_weight:  float = 1e-2
     max_vertex_offset:     Optional[float] = 0.03
+    weld_geometry_vertices: bool = True
+    weld_position_decimals: int = 6
     live_view:             bool  = False
     live_view_every:       int   = 50
     live_view_camera:      int   = 0
@@ -95,10 +97,23 @@ class TexturePPISPTrainer:
 
         # Optional geometry branch: optimise per-vertex offsets from COLMAP mesh.
         self.learn_geometry = bool(config.learn_geometry)
-        self.vertex_offsets = nn.Parameter(
-            torch.zeros_like(self.base_vertices),
+        self._weld_index = None
+        self._num_weld_groups = int(self.base_vertices.shape[0])
+        self._weld_enabled = False
+        if self.learn_geometry and bool(config.weld_geometry_vertices):
+            self._weld_index, self._num_weld_groups = self._build_weld_groups(
+                self.base_vertices, config.weld_position_decimals
+            )
+            self._weld_enabled = self._num_weld_groups < int(self.base_vertices.shape[0])
+
+        geom_shape = ((self._num_weld_groups, 3) if self._weld_enabled
+                      else tuple(self.base_vertices.shape))
+        self.geometry_offsets = nn.Parameter(
+            torch.zeros(geom_shape, device=self.device, dtype=self.base_vertices.dtype),
             requires_grad=self.learn_geometry,
         )
+        # Backward-compat alias for places that still refer to vertex_offsets.
+        self.vertex_offsets = self.geometry_offsets
         self._max_vertex_offset = config.max_vertex_offset
         self._edges = self._build_unique_edges(self.faces)
         if self._edges is not None and self._edges.shape[0] > 0:
@@ -151,7 +166,7 @@ class TexturePPISPTrainer:
                                     betas=(0.9, 0.99), eps=1e-15)
         self.opt_ppisp = optim.Adam(self.ppisp.parameters(),
                                     lr=config.lr_ppisp)
-        self.opt_geom  = (optim.Adam([self.vertex_offsets], lr=config.lr_geometry)
+        self.opt_geom  = (optim.Adam([self.geometry_offsets], lr=config.lr_geometry)
                   if self.learn_geometry else None)
 
         self.iter     = 0
@@ -165,19 +180,28 @@ class TexturePPISPTrainer:
         self._live_view_selector_var = None
         self._init_live_viewer()
 
-        n_tex   = sum(p.numel() for p in self.texture.parameters())
+        n_tex = sum(p.numel() for p in self.texture.parameters())
         n_ppisp = sum(p.numel() for p in self.ppisp.parameters())
-        n_geom  = int(self.vertex_offsets.numel()) if self.learn_geometry else 0
+        n_geom = int(self.geometry_offsets.numel()) if self.learn_geometry else 0
         print(f"\n[Trainer] Device    : {self.device}")
         print(f"[Trainer] Backend   : {'nvdiffrast' if self.rasterizer.uses_nvdiffrast else 'software (SLOW)'}")
         print(f"[Trainer] Cameras   : {len(scene)}")
         print(f"[Trainer] Mesh      : {self.base_vertices.shape[0]:,} verts, {self.faces.shape[0]:,} faces")
         print(f"[Trainer] Texture   : {config.tex_H}×{config.tex_W}  ({n_tex/1e6:.1f}M params)")
         print(f"[Trainer] PPISP     : {n_ppisp} params  ({len(scene)} cameras)")
-        print(f"[Trainer] Geometry  : {'on' if self.learn_geometry else 'off'}"
-              f"{f'  ({n_geom/1e6:.1f}M offset params)' if self.learn_geometry else ''}")
-        print(f"[Trainer] AMP       : {'on' if self._amp_enabled else 'off'}"
-              f"{f' ({config.amp_dtype})' if self._amp_enabled else ''}")
+        print(
+            f"[Trainer] Geometry  : {'on' if self.learn_geometry else 'off'}"
+            f"{f'  ({n_geom/1e6:.1f}M offset params)' if self.learn_geometry else ''}"
+        )
+        if self.learn_geometry:
+            print(
+                f"[Trainer] WeldGeom  : {'on' if self._weld_enabled else 'off'}"
+                f"  ({self._num_weld_groups:,} groups from {self.base_vertices.shape[0]:,} verts)"
+            )
+        print(
+            f"[Trainer] AMP       : {'on' if self._amp_enabled else 'off'}"
+            f"{f' ({config.amp_dtype})' if self._amp_enabled else ''}"
+        )
         print(f"[Trainer] TF32      : {'on' if (self.device.type == 'cuda' and config.use_tf32) else 'off'}")
         print(f"[Trainer] Iterations: {config.num_iterations}")
 
@@ -379,6 +403,22 @@ class TexturePPISPTrainer:
         except Exception:
             pass
 
+    def _build_weld_groups(self, vertices: torch.Tensor, decimals: int):
+        """
+        Group vertices by rounded XYZ so duplicated seam vertices move together.
+        Returns (vertex_to_group_index, num_groups).
+        """
+        verts_np = vertices.detach().cpu().numpy()
+        key_np = np.round(verts_np, decimals=max(0, int(decimals)))
+        _, inverse = np.unique(key_np, axis=0, return_inverse=True)
+        v2g = torch.from_numpy(inverse.astype(np.int64)).to(self.device)
+        return v2g, int(v2g.max().item() + 1) if v2g.numel() > 0 else 0
+
+    def _expanded_geometry_offsets(self) -> torch.Tensor:
+        if not self._weld_enabled or self._weld_index is None:
+            return self.geometry_offsets
+        return self.geometry_offsets[self._weld_index]
+
     def _build_unique_edges(self, faces: torch.Tensor) -> Optional[torch.Tensor]:
         if faces.numel() == 0:
             return None
@@ -392,10 +432,11 @@ class TexturePPISPTrainer:
     def current_vertices(self) -> torch.Tensor:
         if not self.learn_geometry:
             return self.base_vertices
+        offsets_full = self._expanded_geometry_offsets()
         if self._max_vertex_offset is None:
-            offsets = self.vertex_offsets
+            offsets = offsets_full
         else:
-            offsets = torch.tanh(self.vertex_offsets) * float(self._max_vertex_offset)
+            offsets = torch.tanh(offsets_full) * float(self._max_vertex_offset)
         return self.base_vertices + offsets
 
     def _geometry_regularization(self, vertices: torch.Tensor) -> dict:
@@ -461,7 +502,7 @@ class TexturePPISPTrainer:
             p.requires_grad_(train_tex)
 
         train_geom = self.learn_geometry and (self.iter >= self.cfg.geometry_warmup_iters)
-        self.vertex_offsets.requires_grad_(train_geom)
+        self.geometry_offsets.requires_grad_(train_geom)
 
         self.opt_tex.zero_grad(set_to_none=True)
         self.opt_ppisp.zero_grad(set_to_none=True)
@@ -484,7 +525,7 @@ class TexturePPISPTrainer:
                 torch.nn.utils.clip_grad_norm_(self.texture.parameters(), 1.0)
             if train_geom and self.opt_geom is not None:
                 self._grad_scaler.unscale_(self.opt_geom)
-                torch.nn.utils.clip_grad_norm_([self.vertex_offsets], 1.0)
+                torch.nn.utils.clip_grad_norm_([self.geometry_offsets], 1.0)
 
             if train_tex:
                 self._grad_scaler.step(self.opt_tex)
@@ -499,7 +540,7 @@ class TexturePPISPTrainer:
                 torch.nn.utils.clip_grad_norm_(self.texture.parameters(), 1.0)
                 self.opt_tex.step()
             if train_geom and self.opt_geom is not None:
-                torch.nn.utils.clip_grad_norm_([self.vertex_offsets], 1.0)
+                torch.nn.utils.clip_grad_norm_([self.geometry_offsets], 1.0)
                 self.opt_geom.step()
             self.opt_ppisp.step()
 
@@ -600,7 +641,10 @@ class TexturePPISPTrainer:
             "ppisp":      self.ppisp.state_dict(),
             "opt_tex":    self.opt_tex.state_dict(),
             "opt_ppisp":  self.opt_ppisp.state_dict(),
-            "vertex_offsets": self.vertex_offsets.detach().cpu() if self.learn_geometry else None,
+            "vertex_offsets": self.geometry_offsets.detach().cpu() if self.learn_geometry else None,
+            "geometry_offsets": self.geometry_offsets.detach().cpu() if self.learn_geometry else None,
+            "weld_enabled": self._weld_enabled,
+            "weld_index": self._weld_index.detach().cpu() if self._weld_index is not None else None,
             "opt_geom":   self.opt_geom.state_dict() if self.opt_geom is not None else None,
             "amp_enabled": self._amp_enabled,
             "amp_dtype": self.cfg.amp_dtype,
@@ -629,9 +673,23 @@ class TexturePPISPTrainer:
         self.ppisp.load_state_dict(ckpt["ppisp"])
         self.opt_tex.load_state_dict(ckpt["opt_tex"])
         self.opt_ppisp.load_state_dict(ckpt["opt_ppisp"])
-        if self.learn_geometry and ckpt.get("vertex_offsets") is not None:
-            with torch.no_grad():
-                self.vertex_offsets.copy_(ckpt["vertex_offsets"].to(self.device))
+        if self.learn_geometry:
+            geom_blob = ckpt.get("geometry_offsets", ckpt.get("vertex_offsets"))
+            if geom_blob is not None:
+                geom_blob = geom_blob.to(self.device)
+                with torch.no_grad():
+                    if geom_blob.shape == self.geometry_offsets.shape:
+                        self.geometry_offsets.copy_(geom_blob)
+                    elif (self._weld_enabled and geom_blob.shape == self.base_vertices.shape):
+                        # Backward compatibility: old checkpoints may store per-vertex offsets.
+                        # Collapse them to welded-group offsets by averaging per group.
+                        sums = torch.zeros_like(self.geometry_offsets)
+                        counts = torch.zeros(self.geometry_offsets.shape[0], device=self.device, dtype=self.geometry_offsets.dtype)
+                        sums.index_add_(0, self._weld_index, geom_blob)
+                        counts.index_add_(0, self._weld_index, torch.ones(self.base_vertices.shape[0], device=self.device, dtype=self.geometry_offsets.dtype))
+                        self.geometry_offsets.copy_(sums / counts.clamp(min=1.0).unsqueeze(1))
+                    else:
+                        print("[Trainer] WARNING: geometry offset shape mismatch in checkpoint; keeping current geometry offsets")
             if self.opt_geom is not None and ckpt.get("opt_geom") is not None:
                 self.opt_geom.load_state_dict(ckpt["opt_geom"])
         if self._grad_scaler is not None and ckpt.get("grad_scaler") is not None:
