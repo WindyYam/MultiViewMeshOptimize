@@ -134,20 +134,25 @@ class NvdiffrastRasterizer:
                uvs:      torch.Tensor,  # (V,2) [0,1]
                texture:  TextureMap,
                R: torch.Tensor, t: torch.Tensor, K: torch.Tensor,
-               W: int, H: int) -> torch.Tensor:
+             W: int, H: int,
+             return_mask: bool = False):
         """Returns (H, W, 3) float32. Fully differentiable."""
         dr = self.dr
+
+        faces_i32 = faces.to(torch.int32).contiguous()
 
         # 1) Project to clip space
         verts_clip = to_clip_space(vertices, R, t, K, W, H)      # (1,V,4)
 
         # 2) Rasterize
         rast, rast_db = dr.rasterize(self.glctx, verts_clip,
-                                     faces, resolution=[H, W])   # (1,H,W,4)
+                         faces_i32, resolution=[H, W])   # (1,H,W,4)
+        rast = rast.contiguous()
+        rast_db = rast_db.contiguous()
 
         # 3) Interpolate UVs + screen-space derivatives for mip-mapping
-        uv_attr = uvs.unsqueeze(0)                                # (1,V,2)
-        texc, texc_db = dr.interpolate(uv_attr, rast, faces,
+        uv_attr = uvs.unsqueeze(0).contiguous()                   # (1,V,2)
+        texc, texc_db = dr.interpolate(uv_attr, rast, faces_i32,
                                        rast_db=rast_db,
                                        diff_attrs="all")          # (1,H,W,2)
 
@@ -162,8 +167,13 @@ class NvdiffrastRasterizer:
             color = dr.texture(tex_hwc, texc_c, filter_mode="linear")
 
         # 5) Antialias edges
-        color = dr.antialias(color, rast, verts_clip, faces)     # (1,H,W,3)
-        return color.squeeze(0)                                   # (H,W,3)
+        color = dr.antialias(color, rast, verts_clip, faces_i32) # (1,H,W,3)
+        color = color.squeeze(0)                                   # (H,W,3)
+        if not return_mask:
+            return color
+
+        mask = (rast[..., 3:4] > 0).float().squeeze(0)            # (H,W,1)
+        return color, mask
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +184,8 @@ class SoftwareRasterizer:
     def __init__(self, device: torch.device):
         self.device = device
 
-    def render(self, vertices, faces, uvs, texture, R, t, K, W, H):
+    def render(self, vertices, faces, uvs, texture, R, t, K, W, H,
+               return_mask: bool = False):
         pts_cam  = (R @ vertices.T).T + t
         depth    = pts_cam[:, 2]
         pts_img  = (K @ pts_cam.T).T
@@ -222,7 +233,11 @@ class SoftwareRasterizer:
                 if z[iy[k], ix[k]] < z_buf[py, px]:
                     z_buf[py, px] = z[iy[k], ix[k]].detach()
                     image[py, px] = texture.sample(uv_t[iy[k], ix[k]].unsqueeze(0))[0]
-        return image
+        if not return_mask:
+            return image
+
+        mask = torch.isfinite(z_buf).to(image.dtype).unsqueeze(-1)
+        return image, mask
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +252,14 @@ class Rasterizer:
 
     def render(self, vertices, faces, uvs, texture, R, t, K, W, H) -> torch.Tensor:
         if self._nvdr.available:
-            return self._nvdr.render(vertices, faces.to(torch.int32),
+            return self._nvdr.render(vertices, faces,
                                      uvs, texture, R, t, K, W, H)
         return self._sw.render(vertices, faces, uvs, texture, R, t, K, W, H)
+
+    def render_with_mask(self, vertices, faces, uvs, texture, R, t, K, W, H):
+        if self._nvdr.available:
+            return self._nvdr.render(vertices, faces,
+                                     uvs, texture, R, t, K, W, H,
+                                     return_mask=True)
+        return self._sw.render(vertices, faces, uvs, texture, R, t, K, W, H,
+                               return_mask=True)

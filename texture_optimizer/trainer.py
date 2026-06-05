@@ -58,6 +58,7 @@ class TrainConfig:
     geometry_warmup_iters: int = 1000
     geom_reg_l2_weight:    float = 1e-3
     geom_reg_edge_weight:  float = 1e-2
+    geom_smooth_weight:    float = 1e-2
     max_vertex_offset:     Optional[float] = 0.03
     weld_geometry_vertices: bool = True
     weld_position_decimals: int = 6
@@ -120,8 +121,14 @@ class TexturePPISPTrainer:
             v0 = self.base_vertices[self._edges[:, 0]]
             v1 = self.base_vertices[self._edges[:, 1]]
             self._base_edge_lengths = (v0 - v1).norm(dim=1).detach()
+            deg = torch.zeros(self.base_vertices.shape[0], device=self.device, dtype=self.base_vertices.dtype)
+            ones = torch.ones(self._edges.shape[0], device=self.device, dtype=self.base_vertices.dtype)
+            deg.index_add_(0, self._edges[:, 0], ones)
+            deg.index_add_(0, self._edges[:, 1], ones)
+            self._vertex_degree = deg.clamp(min=1.0)
         else:
             self._base_edge_lengths = None
+            self._vertex_degree = None
 
         # ---- Texture ----
         self.texture = TextureMap(
@@ -461,11 +468,27 @@ class TexturePPISPTrainer:
             "geom_reg": geom_reg,
         }
 
+    def _geometry_smoothness_loss(self, vertices: torch.Tensor) -> torch.Tensor:
+        """
+        Penalize roughness on the final mesh itself using a uniform Laplacian:
+        each vertex should stay close to the mean of its 1-ring neighbors.
+        """
+        if (not self.learn_geometry or self._edges is None or
+                self._edges.shape[0] == 0 or self._vertex_degree is None):
+            return torch.tensor(0.0, device=self.device)
+
+        nbr_sum = torch.zeros_like(vertices)
+        nbr_sum.index_add_(0, self._edges[:, 0], vertices[self._edges[:, 1]])
+        nbr_sum.index_add_(0, self._edges[:, 1], vertices[self._edges[:, 0]])
+        nbr_mean = nbr_sum / self._vertex_degree.unsqueeze(1)
+        lap = vertices - nbr_mean
+        return lap.pow(2).sum(dim=1).mean()
+
     # ------------------------------------------------------------------
     # Render
     # ------------------------------------------------------------------
 
-    def render_view(self, view: CameraView) -> torch.Tensor:
+    def render_view(self, view: CameraView, return_mask: bool = False):
         """Full differentiable render → LDR (H, W, 3) in [0,1]."""
         ci = view.cam_idx
         R  = self._cam_R[ci]
@@ -481,11 +504,15 @@ class TexturePPISPTrainer:
                 gy, gx = torch.meshgrid(ys, xs, indexing="ij")
                 self.ppisp.r2 = gx**2 + gy**2
 
-        hdr = self.rasterizer.render(
+        hdr, mask = self.rasterizer.render_with_mask(
             self.current_vertices(), self.faces, self.uvs,
             self.texture, R, t, K, W, H,
         )
-        return self.ppisp(hdr, ci)
+        ldr = self.ppisp(hdr, ci)
+        pred = ldr * mask
+        if return_mask:
+            return pred, (mask[..., 0] > 0.5)
+        return pred
 
     # ------------------------------------------------------------------
     # Step
@@ -510,11 +537,15 @@ class TexturePPISPTrainer:
             self.opt_geom.zero_grad(set_to_none=True)
 
         with self._autocast_ctx():
-            pred   = self.render_view(view)
-            losses = self.loss_fn(pred, gt, self.texture, self.ppisp)
-            zero = torch.tensor(0.0, device=self.device)
-            geom_losses = {"geom_l2": zero, "geom_edge": zero, "geom_reg": zero}
-            total = losses["total"]
+            pred, mesh_mask = self.render_view(view, return_mask=True)
+            losses = self.loss_fn(pred, gt, self.texture, self.ppisp, mask=mesh_mask)
+            vertices_now = self.current_vertices()
+            geom_smooth = self._geometry_smoothness_loss(vertices_now)
+            geom_smooth_w = float(self.cfg.geom_smooth_weight) if train_geom else 0.0
+            total = losses["total"] + geom_smooth_w * geom_smooth
+            geom_losses = {
+                "geom_smooth": geom_smooth,
+            }
 
         if self._grad_scaler is not None:
             self._grad_scaler.scale(total).backward()
@@ -584,7 +615,7 @@ class TexturePPISPTrainer:
               f"({cfg.warmup_iters} warmup) ...\n")
 
         running = {k: 0.0 for k in (
-            "total", "photo", "tex_reg", "ppisp_reg", "geom_reg", "geom_l2", "geom_edge"
+            "total", "photo", "tex_reg", "ppisp_reg", "geom_smooth"
         )}
         t_iter  = time.time()
 
@@ -609,12 +640,19 @@ class TexturePPISPTrainer:
                 else:
                     mode = "joint"
                 avg      = {k: v / cfg.log_every for k, v in running.items()}
-                geom_txt = (f"  geom={avg['geom_reg']:.5f}"
+                w_photo = cfg.photo_weight * avg["photo"]
+                w_tex_reg = cfg.tex_reg_weight * avg["tex_reg"]
+                w_ppisp_reg = cfg.ppisp_reg_weight * avg["ppisp_reg"]
+                w_smooth = (float(cfg.geom_smooth_weight) * avg["geom_smooth"]
+                            if self.learn_geometry and self.iter >= cfg.geometry_warmup_iters
+                            else 0.0)
+                w_total = w_photo + w_tex_reg + w_ppisp_reg + w_smooth
+                geom_txt = (f"  w_smooth={w_smooth:.5f}"
                             if self.learn_geometry else "")
                 print(
                     f"  {self.iter+1:5d}/{cfg.num_iterations}  [{mode}]  "
-                    f"loss={avg['total']:.4f}  photo={avg['photo']:.4f}  "
-                    f"tex_reg={avg['tex_reg']:.5f}  "
+                    f"w_loss={w_total:.4f}  w_photo={w_photo:.4f}  "
+                    f"w_tex_reg={w_tex_reg:.5f}  w_ppisp_reg={w_ppisp_reg:.5f}  "
                     f"{geom_txt} "
                     f"{it_per_s:.1f} it/s  ETA {eta_s/60:.1f}m"
                 )

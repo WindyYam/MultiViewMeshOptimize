@@ -46,6 +46,8 @@ def parse_args():
                    help="Warmup iterations before geometry updates start")
     p.add_argument("--learn_geometry", action="store_true",
                    help="Enable differentiable mesh geometry updates")
+    p.add_argument("--geom_smooth", type=float, default=1e-2,
+                   help="Geometry smoothness weight (higher = smoother, less rough deformations)")
     p.add_argument("--max_vertex_offset", type=float, default=0,
                    help="Max absolute vertex displacement (scene units); set <=0 to disable clamp")
     p.add_argument("--no_weld_geometry", action="store_true",
@@ -102,6 +104,7 @@ def main():
         cfg.learn_vignette  = not args.no_vignette
         cfg.learn_geometry  = args.learn_geometry
         cfg.geometry_warmup_iters = args.geom_warmup
+        cfg.geom_smooth_weight = args.geom_smooth
         cfg.max_vertex_offset     = (args.max_vertex_offset
                          if args.max_vertex_offset > 0 else None)
         cfg.weld_geometry_vertices = not args.no_weld_geometry
@@ -159,6 +162,7 @@ def main():
     cfg.learn_vignette  = not args.no_vignette
     cfg.learn_geometry  = args.learn_geometry
     cfg.geometry_warmup_iters = args.geom_warmup
+    cfg.geom_smooth_weight = args.geom_smooth
     cfg.max_vertex_offset     = (args.max_vertex_offset
                                  if args.max_vertex_offset > 0 else None)
     cfg.weld_geometry_vertices = not args.no_weld_geometry

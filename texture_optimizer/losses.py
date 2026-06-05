@@ -87,11 +87,15 @@ class PhotometricLoss(nn.Module):
         if mask is not None:
             pred_m   = pred[mask]
             target_m = target[mask]
+            m = mask.to(dtype=pred.dtype).unsqueeze(-1)
+            pred_ssim = pred * m
+            target_ssim = target * m
         else:
             pred_m, target_m = pred, target
+            pred_ssim, target_ssim = pred, target
 
         l1   = F.l1_loss(pred_m, target_m)
-        ssim = _ssim_loss(pred, target)   # SSIM operates on full image
+        ssim = _ssim_loss(pred_ssim, target_ssim)
 
         return self.l1_weight * l1 + self.ssim_weight * ssim
 
