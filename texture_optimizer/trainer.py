@@ -640,35 +640,52 @@ class TexturePPISPTrainer:
         self.loss_log = ckpt.get("loss_log", [])
         print(f"[Trainer] Loaded checkpoint iter {self.iter}: {path}")
 
-    def _export_mesh_obj(self, path: str):
-        mtl_name = "optimized_mesh.mtl"
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("# Exported by texture_optimizer\\n")
-            f.write(f"mtllib {mtl_name}\\n")
-            f.write("usemtl material_0\\n")
+    def _export_mesh_ply(self, path: str, texture_file: str = "optimized_texture.png"):
+        """
+        Export textured mesh as binary little-endian PLY.
+        Uses per-vertex UV properties and a TextureFile header comment.
+        """
+        verts = self.current_vertices().detach().cpu().numpy().astype(np.float32)
+        uvs = self.uvs.detach().cpu().numpy().astype(np.float32)
+        faces = self.faces.detach().cpu().numpy().astype(np.int32)
 
-            verts = self.current_vertices().detach().cpu().numpy()
-            uvs = self.uvs.detach().cpu().numpy()
-            faces = self.faces.detach().cpu().numpy()
+        if uvs.shape[0] != verts.shape[0]:
+            raise RuntimeError(
+                f"UV/vertex mismatch while exporting PLY: {uvs.shape[0]} uvs vs {verts.shape[0]} verts"
+            )
 
-            for v in verts:
-                f.write(f"v {float(v[0]):.9f} {float(v[1]):.9f} {float(v[2]):.9f}\\n")
-            for uv in uvs:
-                # OBJ V grows upward; our UV convention is image-space top-down.
-                f.write(f"vt {float(uv[0]):.9f} {1.0 - float(uv[1]):.9f}\\n")
-            for tri in faces:
-                a, b, c = int(tri[0]) + 1, int(tri[1]) + 1, int(tri[2]) + 1
-                f.write(f"f {a}/{a} {b}/{b} {c}/{c}\\n")
+        # PLY consumers typically interpret UV V with bottom-origin semantics.
+        # Internal UVs are image-space top-origin, so flip V on export.
+        uvs_out = uvs.copy()
+        uvs_out[:, 0] = np.clip(uvs_out[:, 0], 0.0, 1.0)
+        uvs_out[:, 1] = np.clip(1.0 - uvs_out[:, 1], 0.0, 1.0)
 
-        mtl_path = os.path.join(os.path.dirname(path), mtl_name)
-        with open(mtl_path, "w", encoding="utf-8") as f:
-            f.write("newmtl material_0\\n")
-            f.write("Ka 1.000000 1.000000 1.000000\\n")
-            f.write("Kd 1.000000 1.000000 1.000000\\n")
-            f.write("Ks 0.000000 0.000000 0.000000\\n")
-            f.write("d 1.0\\n")
-            f.write("illum 2\\n")
-            f.write("map_Kd optimized_texture.png\\n")
+        vertex_block = np.concatenate([verts, uvs_out], axis=1).astype(np.float32, copy=False)
+
+        face_dtype = np.dtype([("n", np.uint8), ("idx", np.int32, (3,))])
+        face_block = np.empty(faces.shape[0], dtype=face_dtype)
+        face_block["n"] = 3
+        face_block["idx"] = faces
+
+        header = (
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            f"comment TextureFile {texture_file}\n"
+            f"element vertex {verts.shape[0]}\n"
+            "property float x\n"
+            "property float y\n"
+            "property float z\n"
+            "property float texture_u\n"
+            "property float texture_v\n"
+            f"element face {faces.shape[0]}\n"
+            "property list uchar int vertex_indices\n"
+            "end_header\n"
+        )
+
+        with open(path, "wb") as f:
+            f.write(header.encode("ascii"))
+            vertex_block.tofile(f)
+            face_block.tofile(f)
 
     def export_results(self):
         out = self.cfg.output_dir
@@ -686,10 +703,10 @@ class TexturePPISPTrainer:
                        for i in range(len(self.scene))], f, indent=2)
         print(f"[Export] PPISP    → {out}/ppisp_params.json")
 
-        # Optimized geometry (OBJ + MTL + texture reference)
-        mesh_obj = os.path.join(out, "optimized_mesh.obj")
-        self._export_mesh_obj(mesh_obj)
-        print(f"[Export] Mesh     → {mesh_obj}")
+        # Optimized geometry (binary textured PLY)
+        mesh_ply = os.path.join(out, "optimized_mesh.ply")
+        self._export_mesh_ply(mesh_ply, texture_file="optimized_texture.png")
+        print(f"[Export] Mesh     → {mesh_ply}")
 
         # Loss curve
         np.save(os.path.join(out, "loss_log.npy"),

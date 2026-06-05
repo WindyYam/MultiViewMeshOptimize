@@ -105,6 +105,47 @@ def _load_colmap_pycolmap(sparse_dir: str) -> List[dict]:
     import pycolmap
     rec = pycolmap.Reconstruction(sparse_dir)
 
+    def _maybe_call(x):
+        return x() if callable(x) else x
+
+    def _extract_pose(img):
+        """
+        Return (qvec_wxyz, tvec_xyz) for multiple pycolmap versions.
+        Newer versions expose cam_from_world as property or method and do not
+        expose qvec/tvec directly on Image.
+        """
+        # Newer pycolmap path
+        if hasattr(img, "cam_from_world"):
+            xform = _maybe_call(getattr(img, "cam_from_world"))
+            if xform is not None:
+                rot = _maybe_call(getattr(xform, "rotation", None))
+                q = None
+                if rot is not None and hasattr(rot, "quat"):
+                    q = _maybe_call(getattr(rot, "quat"))
+                elif hasattr(xform, "quat"):
+                    q = _maybe_call(getattr(xform, "quat"))
+
+                t = _maybe_call(getattr(xform, "translation", None))
+                if t is None and hasattr(xform, "tvec"):
+                    t = _maybe_call(getattr(xform, "tvec"))
+
+                if q is not None and t is not None:
+                    q = np.asarray(q, dtype=np.float64).reshape(-1)
+                    t = np.asarray(t, dtype=np.float64).reshape(-1)
+                    if q.size >= 4 and t.size >= 3:
+                        # pycolmap Rotation3d.quat is commonly xyzw.
+                        qvec = [float(q[3]), float(q[0]), float(q[1]), float(q[2])]
+                        tvec = [float(t[0]), float(t[1]), float(t[2])]
+                        return qvec, tvec
+
+        # Older pycolmap path
+        if hasattr(img, "qvec") and hasattr(img, "tvec"):
+            qvec = list(map(float, img.qvec))
+            tvec = list(map(float, img.tvec))
+            return qvec, tvec
+
+        raise AttributeError("Could not extract pose from pycolmap Image")
+
     cam_info = {}
     for cam_id, cam in rec.cameras.items():
         W, H = int(cam.width), int(cam.height)
@@ -123,24 +164,7 @@ def _load_colmap_pycolmap(sparse_dir: str) -> List[dict]:
     records = []
     for img_id, img in rec.images.items():
         cam_id = img.camera_id
-
-        # Extract quaternion — API changed across pycolmap versions:
-        #   v0.3+  : img.cam_from_world  is a Rigid3d with .rotation.quat (xyzw)
-        #   v0.2   : img.qvec            is (w,x,y,z) directly
-        try:
-            # v0.3+ path
-            xform = img.cam_from_world
-            # .rotation might be a Rotation3d with .quat, or directly callable
-            rot = xform.rotation
-            if callable(rot):
-                rot = rot()
-            q = rot.quat   # xyzw in newer pycolmap
-            qvec = [float(q[3]), float(q[0]), float(q[1]), float(q[2])]
-            tvec = list(map(float, xform.translation))
-        except AttributeError:
-            # v0.2 path: img.qvec is already (w,x,y,z)
-            qvec = list(map(float, img.qvec))
-            tvec = list(map(float, img.tvec))
+        qvec, tvec = _extract_pose(img)
 
         records.append(dict(
             img_id=img_id,

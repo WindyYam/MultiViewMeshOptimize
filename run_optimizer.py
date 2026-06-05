@@ -50,7 +50,7 @@ def parse_args():
                    help="L2 regularization weight on vertex displacements")
     p.add_argument("--geom_reg_edge", type=float, default=1e-2,
                    help="Edge-length preservation weight for geometry updates")
-    p.add_argument("--max_vertex_offset", type=float, default=1,
+    p.add_argument("--max_vertex_offset", type=float, default=0,
                    help="Max absolute vertex displacement (scene units); set <=0 to disable clamp")
     p.add_argument("--no_vignette", action="store_true",
                    help="Disable per-camera vignette learning")
