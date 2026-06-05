@@ -36,7 +36,7 @@ def parse_args():
                    help="Target output texture long side (aspect ratio preserved from input texture when available)")
     p.add_argument("--progressive_tex", action="store_true",
                    help="Use progressive texture upscaling during training (1/4 -> 1/2 -> full)")
-    p.add_argument("--lr_tex",      type=float, default=1e-3,
+    p.add_argument("--lr_tex",      type=float, default=2e-3,
                    help="Texture learning rate")
     p.add_argument("--lr_ppisp",    type=float, default=5e-3,
                    help="PPISP learning rate")
@@ -47,22 +47,20 @@ def parse_args():
     p.add_argument("--ssim_backend", type=str, default="auto",
                    choices=["auto", "native", "msssim"],
                    help="SSIM backend: auto (prefer pytorch_msssim), native, or msssim")
-    p.add_argument("--lr_geom",     type=float, default=1e-4,
+    p.add_argument("--lr_geom",     type=float, default=2e-4,
                    help="Geometry (vertex offsets) learning rate")
     p.add_argument("--warmup",      type=int,   default=500,
                    help="Warmup iterations (PPISP only, texture frozen)")
-    p.add_argument("--tex_update_every", type=int, default=1,
+    p.add_argument("--tex_update_every", type=int, default=2,
                    help="Update texture every N iterations after warmup")
-    p.add_argument("--geom_warmup", type=int,   default=1000,
+    p.add_argument("--geom_warmup", type=int,   default=500,
                    help="Warmup iterations before geometry updates start")
     p.add_argument("--geom_update_every", type=int, default=1,
                    help="Update geometry every N iterations after geom warmup")
-    p.add_argument("--geom_smooth_every", type=int, default=2,
-                   help="Compute geometry smoothness every N geometry-update iterations")
+    p.add_argument("--geom_tv_weight", type=float, default=5e-2,
+                   help="Weight for geometry normal-TV regularization")
     p.add_argument("--learn_geometry", action="store_true",
                    help="Enable differentiable mesh geometry updates")
-    p.add_argument("--geom_smooth", type=float, default=1e-2,
-                   help="Geometry smoothness weight (higher = smoother, less rough deformations)")
     p.add_argument("--max_vertex_offset", type=float, default=0,
                    help="Max absolute vertex displacement (scene units); set <=0 to disable clamp")
     p.add_argument("--no_weld_geometry", action="store_true",
@@ -131,8 +129,7 @@ def main():
         cfg.learn_geometry  = args.learn_geometry
         cfg.geometry_warmup_iters = args.geom_warmup
         cfg.geom_update_every = max(1, args.geom_update_every)
-        cfg.geom_smooth_every = max(1, args.geom_smooth_every)
-        cfg.geom_smooth_weight = args.geom_smooth
+        cfg.geom_normal_tv_weight = args.geom_tv_weight
         cfg.max_vertex_offset     = (args.max_vertex_offset
                          if args.max_vertex_offset > 0 else None)
         cfg.weld_geometry_vertices = not args.no_weld_geometry
@@ -199,8 +196,7 @@ def main():
     cfg.learn_geometry  = args.learn_geometry
     cfg.geometry_warmup_iters = args.geom_warmup
     cfg.geom_update_every = max(1, args.geom_update_every)
-    cfg.geom_smooth_every = max(1, args.geom_smooth_every)
-    cfg.geom_smooth_weight = args.geom_smooth
+    cfg.geom_normal_tv_weight = args.geom_tv_weight
     cfg.max_vertex_offset     = (args.max_vertex_offset
                                  if args.max_vertex_offset > 0 else None)
     cfg.weld_geometry_vertices = not args.no_weld_geometry
