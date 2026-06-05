@@ -20,6 +20,7 @@ ready for the optimiser.
 import os
 import re
 import json
+import warnings
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 from dataclasses import dataclass, field
@@ -27,6 +28,23 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 from PIL import Image
+
+
+def _open_rgb_image(path: str) -> Image.Image:
+    """Open an RGB image and allow trusted oversized textures when needed."""
+    try:
+        return Image.open(path).convert("RGB")
+    except Image.DecompressionBombError:
+        # Some reconstructed texture atlases legitimately exceed Pillow's
+        # default safety threshold. Retry with the limit disabled for this load.
+        old_limit = Image.MAX_IMAGE_PIXELS
+        try:
+            Image.MAX_IMAGE_PIXELS = None
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+                return Image.open(path).convert("RGB")
+        finally:
+            Image.MAX_IMAGE_PIXELS = old_limit
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +589,7 @@ def load_ply(ply_path: str) -> MeshData:
     if tex_file:
         tex_path = os.path.join(tex_dir, tex_file)
         if os.path.exists(tex_path):
-            img = Image.open(tex_path).convert("RGB")
+            img = _open_rgb_image(tex_path)
             tex_image = torch.from_numpy(np.array(img, dtype=np.float32) / 255.0)
             print(f"[load_ply]   Loaded texture: {tex_file}  {tex_image.shape}")
         else:
@@ -701,7 +719,7 @@ def load_obj(obj_path: str) -> MeshData:
     # Load initial texture
     tex_image = None
     if tex_path and os.path.exists(tex_path):
-        img = Image.open(tex_path).convert("RGB")
+        img = _open_rgb_image(tex_path)
         tex_image = torch.from_numpy(np.array(img, dtype=np.float32) / 255.0)
 
     return MeshData(
@@ -747,7 +765,7 @@ def _find_and_load_mesh(scene_root, mesh_path=None):
 
 def load_image(path: str, W: int = None, H: int = None) -> torch.Tensor:
     """Load RGB image to float32 [0,1] tensor (H, W, 3)."""
-    img = Image.open(path).convert("RGB")
+    img = _open_rgb_image(path)
     if W is not None and H is not None:
         img = img.resize((W, H), Image.BILINEAR)
     return torch.from_numpy(np.array(img, dtype=np.float32) / 255.0)
