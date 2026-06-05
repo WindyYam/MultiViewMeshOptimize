@@ -546,7 +546,11 @@ def load_ply(ply_path: str) -> MeshData:
         vi, v_name = _col_first("texture_v","t","v","texcoord_v","texture_t","tex_v")
         if ui is not None and vi is not None:
             print(f"[load_ply]   UV layout: per-vertex  ('{u_name}' col {ui}, '{v_name}' col {vi})")
-            uvs = torch.from_numpy(vert_data[:, [ui, vi]])
+            # Keep internal UV convention consistent across OBJ/PLY layouts:
+            # U in [0,1], V top-origin (image space). Most file formats store
+            # per-vertex V with bottom-origin semantics, so we flip here.
+            uvs = torch.from_numpy(vert_data[:, [ui, vi]]).clone()
+            uvs[:, 1] = 1.0 - uvs[:, 1]
         else:
             print(f"[load_ply]   No UV found — generating spherical UVs")
             import math
