@@ -53,6 +53,8 @@ class TrainConfig:
     tex_H:            int   = 1024
     tex_W:            int   = 1024
     progressive_texture: bool = False
+    texture_dtype:    str   = "auto"   # auto, fp32, fp16, bf16
+    tex_optimizer:    str   = "adam"   # adam, sgd
 
     log_every:        int   = 50
     save_every:       int   = 500
@@ -103,6 +105,7 @@ class TexturePPISPTrainer:
         self._amp_dtype = None
         self._grad_scaler = None
         self._configure_acceleration()
+        self._texture_dtype = self._resolve_texture_dtype(config.texture_dtype)
 
         # ---- Mesh ----
         self.base_vertices = scene.mesh.vertices.to(self.device)
@@ -164,6 +167,7 @@ class TexturePPISPTrainer:
             init_tex_h, init_tex_w,
             init_image=scene.mesh.tex_image,
         ).to(self.device)
+        self._cast_texture_parameter()
 
         # ---- PPISP ----
         v0 = scene.views[0]
@@ -225,6 +229,12 @@ class TexturePPISPTrainer:
         print(f"[Trainer] Cameras   : {len(scene)}")
         print(f"[Trainer] Mesh      : {self.base_vertices.shape[0]:,} verts, {self.faces.shape[0]:,} faces")
         print(f"[Trainer] Texture   : {init_tex_h}×{init_tex_w} -> {self._full_tex_H}×{self._full_tex_W}  ({n_tex/1e6:.1f}M params)")
+        tex_mem = self._estimate_texture_memory_bytes(n_tex)
+        print(
+            f"[Trainer] TexOpt    : {str(config.tex_optimizer).lower()}  dtype={str(config.texture_dtype).lower()}"
+            f" (active={str(self._texture_dtype).split('.')[-1]})"
+        )
+        print(f"[Trainer] TexMem≈   : {tex_mem/1024**3:.2f} GiB (param+grad+opt state)")
         print(f"[Trainer] PPISP     : {n_ppisp} params  ({len(scene)} cameras)")
         print(
             f"[Trainer] Geometry  : {'on' if self.learn_geometry else 'off'}"
@@ -268,12 +278,44 @@ class TexturePPISPTrainer:
         print(f"[Trainer] Iterations: {config.num_iterations}")
 
     def _create_tex_optimizer(self):
+        mode = str(self.cfg.tex_optimizer).lower()
+        if mode == "sgd":
+            return optim.SGD(self.texture.parameters(), lr=self.cfg.lr_texture, momentum=0.0)
         return self._create_adam(
             self.texture.parameters(),
             lr=self.cfg.lr_texture,
             betas=(0.9, 0.99),
             eps=1e-15,
         )
+
+    def _resolve_texture_dtype(self, mode: str):
+        mode_l = str(mode).lower()
+        if mode_l == "auto":
+            if self.device.type == "cuda" and self._amp_enabled and self._amp_dtype is not None:
+                return self._amp_dtype
+            return torch.float32
+        if mode_l == "fp16":
+            return torch.float16
+        if mode_l == "bf16":
+            return torch.bfloat16
+        return torch.float32
+
+    def _cast_texture_parameter(self):
+        target_dtype = self._texture_dtype
+        if self.device.type != "cuda" and target_dtype != torch.float32:
+            target_dtype = torch.float32
+        if self.texture.tex.dtype == target_dtype:
+            return
+        with torch.no_grad():
+            casted = self.texture.tex.detach().to(dtype=target_dtype)
+        self.texture.tex = nn.Parameter(casted)
+
+    def _estimate_texture_memory_bytes(self, n_tex: int) -> float:
+        bpp = torch.finfo(self._texture_dtype).bits // 8
+        mode = str(self.cfg.tex_optimizer).lower()
+        # param + grad + optimizer state tensors
+        state_mult = 2.0 if mode == "adam" else 0.0
+        return float(n_tex) * float(bpp) * (2.0 + state_mult)
 
     def _create_adam(self, params, lr: float, betas=(0.9, 0.999), eps=1e-8):
         kwargs = {
@@ -328,7 +370,7 @@ class TexturePPISPTrainer:
                 size=(target_h, target_w),
                 mode="bilinear",
                 align_corners=False,
-            )
+            ).to(dtype=self._texture_dtype)
         self.texture.tex = nn.Parameter(tex_up)
         self.opt_tex = self._create_tex_optimizer()
         self._tex_stage = stage

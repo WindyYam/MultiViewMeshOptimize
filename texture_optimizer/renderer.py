@@ -156,15 +156,25 @@ class NvdiffrastRasterizer:
                                        rast_db=rast_db,
                                        diff_attrs="all")          # (1,H,W,2)
 
-        # 4) Sample texture (nvdiffrast needs contiguous float32)
-        tex_hwc = torch.clamp(texture.tex, 0, 1).float().permute(0, 2, 3, 1).contiguous()
-        texc_c  = texc.float().contiguous()
+        # 4) Sample texture. Keep atlas dtype when possible to reduce VRAM.
+        tex_hwc = torch.clamp(texture.tex, 0, 1).permute(0, 2, 3, 1).contiguous()
+        texc_c  = texc.to(dtype=tex_hwc.dtype).contiguous()
+        texc_db_c = texc_db.to(dtype=tex_hwc.dtype).contiguous()
         try:
             color = dr.texture(tex_hwc, texc_c,
-                               uv_da=texc_db.float().contiguous(),
+                               uv_da=texc_db_c,
                                filter_mode="linear-mipmap-linear")
         except Exception:
-            color = dr.texture(tex_hwc, texc_c, filter_mode="linear")
+            # Conservative fallback for driver/backend combinations that only
+            # accept float32 texture inputs.
+            tex_hwc_f32 = tex_hwc.float().contiguous()
+            texc_f32 = texc.float().contiguous()
+            try:
+                color = dr.texture(tex_hwc_f32, texc_f32,
+                                   uv_da=texc_db.float().contiguous(),
+                                   filter_mode="linear-mipmap-linear")
+            except Exception:
+                color = dr.texture(tex_hwc_f32, texc_f32, filter_mode="linear")
 
         # 5) Antialias edges
         color = dr.antialias(color, rast, verts_clip, faces_i32) # (1,H,W,3)

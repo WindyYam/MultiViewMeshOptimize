@@ -34,6 +34,10 @@ def parse_args():
                    help="GT image downscale factor (0.5 = half-res, faster)")
     p.add_argument("--tex_res",     type=int,   default=1024,
                    help="Target output texture long side (aspect ratio preserved from input texture when available)")
+    p.add_argument("--tex_dtype", type=str, default="auto", choices=["auto", "fp32", "fp16", "bf16"],
+                   help="Texture parameter dtype (auto follows AMP on CUDA; lowers VRAM when fp16/bf16)")
+    p.add_argument("--tex_optimizer", type=str, default="adam", choices=["adam", "sgd"],
+                   help="Texture optimizer (sgd reduces VRAM vs adam)")
     p.add_argument("--progressive_tex", action="store_true",
                    help="Use progressive texture upscaling during training (1/4 -> 1/2 -> full)")
     p.add_argument("--lr_tex",      type=float, default=2e-3,
@@ -81,8 +85,10 @@ def parse_args():
                    help="Initial camera index for live view")
     p.add_argument("--live_view_max_size", type=int, default=1200,
                    help="Max preview width/height in pixels for live window")
-    p.add_argument("--amp", action="store_true",
-                   help="Enable mixed precision acceleration on CUDA")
+    p.add_argument("--amp", action="store_true", default=True,
+                   help="Enable mixed precision acceleration on CUDA (default: enabled)")
+    p.add_argument("--no_amp", action="store_false", dest="amp",
+                   help="Disable mixed precision acceleration")
     p.add_argument("--amp_dtype", type=str, default="bf16", choices=["fp16", "bf16"],
                    help="AMP dtype to use when --amp is enabled")
     p.add_argument("--no_amp_loss_fp32", action="store_true",
@@ -121,6 +127,8 @@ def main():
         cfg.lr_texture      = args.lr_tex
         cfg.lr_ppisp        = args.lr_ppisp
         cfg.progressive_texture = args.progressive_tex
+        cfg.texture_dtype   = args.tex_dtype
+        cfg.tex_optimizer   = args.tex_optimizer
         cfg.l1_weight       = args.l1_weight
         cfg.ssim_weight     = args.ssim_weight
         cfg.ssim_backend    = args.ssim_backend
@@ -188,6 +196,8 @@ def main():
     cfg.lr_texture      = args.lr_tex
     cfg.lr_ppisp        = args.lr_ppisp
     cfg.progressive_texture = args.progressive_tex
+    cfg.texture_dtype   = args.tex_dtype
+    cfg.tex_optimizer   = args.tex_optimizer
     cfg.l1_weight       = args.l1_weight
     cfg.ssim_weight     = args.ssim_weight
     cfg.ssim_backend    = args.ssim_backend
