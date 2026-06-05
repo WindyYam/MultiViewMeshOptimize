@@ -512,8 +512,9 @@ class TexturePPISPTrainer:
         with self._autocast_ctx():
             pred   = self.render_view(view)
             losses = self.loss_fn(pred, gt, self.texture, self.ppisp)
-            geom_losses = self._geometry_regularization(self.current_vertices())
-            total = losses["total"] + geom_losses["geom_reg"]
+            zero = torch.tensor(0.0, device=self.device)
+            geom_losses = {"geom_l2": zero, "geom_edge": zero, "geom_reg": zero}
+            total = losses["total"]
 
         if self._grad_scaler is not None:
             self._grad_scaler.scale(total).backward()
