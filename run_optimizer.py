@@ -38,8 +38,20 @@ def parse_args():
                    help="Texture learning rate")
     p.add_argument("--lr_ppisp",    type=float, default=5e-3,
                    help="PPISP learning rate")
+    p.add_argument("--lr_geom",     type=float, default=1e-4,
+                   help="Geometry (vertex offsets) learning rate")
     p.add_argument("--warmup",      type=int,   default=500,
                    help="Warmup iterations (PPISP only, texture frozen)")
+    p.add_argument("--geom_warmup", type=int,   default=1000,
+                   help="Warmup iterations before geometry updates start")
+    p.add_argument("--learn_geometry", action="store_true",
+                   help="Enable differentiable mesh geometry updates")
+    p.add_argument("--geom_reg_l2",   type=float, default=1e-3,
+                   help="L2 regularization weight on vertex displacements")
+    p.add_argument("--geom_reg_edge", type=float, default=1e-2,
+                   help="Edge-length preservation weight for geometry updates")
+    p.add_argument("--max_vertex_offset", type=float, default=0.03,
+                   help="Max absolute vertex displacement (scene units); set <=0 to disable clamp")
     p.add_argument("--no_vignette", action="store_true",
                    help="Disable per-camera vignette learning")
     p.add_argument("--resume",      type=str,   default=None,
@@ -48,6 +60,14 @@ def parse_args():
                    help="cuda or cpu (auto-detected if omitted)")
     p.add_argument("--max_cameras", type=int,   default=None,
                    help="Cap number of cameras loaded (useful for quick tests)")
+    p.add_argument("--live_view", action="store_true",
+                   help="Show interactive live render window during training")
+    p.add_argument("--live_view_every", type=int, default=50,
+                   help="Update live render every N iterations")
+    p.add_argument("--live_view_cam", type=int, default=0,
+                   help="Initial camera index for live view")
+    p.add_argument("--live_view_max_size", type=int, default=1200,
+                   help="Max preview width/height in pixels for live window")
     return p.parse_args()
 
 
@@ -74,7 +94,18 @@ def main():
         cfg.warmup_iters    = min(50, args.iters // 10)
         cfg.lr_texture      = args.lr_tex
         cfg.lr_ppisp        = args.lr_ppisp
+        cfg.lr_geometry     = args.lr_geom
         cfg.learn_vignette  = not args.no_vignette
+        cfg.learn_geometry  = args.learn_geometry
+        cfg.geometry_warmup_iters = args.geom_warmup
+        cfg.geom_reg_l2_weight    = args.geom_reg_l2
+        cfg.geom_reg_edge_weight  = args.geom_reg_edge
+        cfg.max_vertex_offset     = (args.max_vertex_offset
+                         if args.max_vertex_offset > 0 else None)
+        cfg.live_view       = args.live_view
+        cfg.live_view_every = args.live_view_every
+        cfg.live_view_camera = args.live_view_cam
+        cfg.live_view_max_size = args.live_view_max_size
         cfg.device          = str(device)
         cfg.log_every       = max(1, args.iters // 30)
         cfg.save_every      = max(1, args.iters // 5)
@@ -107,7 +138,18 @@ def main():
     cfg.warmup_iters    = args.warmup
     cfg.lr_texture      = args.lr_tex
     cfg.lr_ppisp        = args.lr_ppisp
+    cfg.lr_geometry     = args.lr_geom
     cfg.learn_vignette  = not args.no_vignette
+    cfg.learn_geometry  = args.learn_geometry
+    cfg.geometry_warmup_iters = args.geom_warmup
+    cfg.geom_reg_l2_weight    = args.geom_reg_l2
+    cfg.geom_reg_edge_weight  = args.geom_reg_edge
+    cfg.max_vertex_offset     = (args.max_vertex_offset
+                                 if args.max_vertex_offset > 0 else None)
+    cfg.live_view       = args.live_view
+    cfg.live_view_every = args.live_view_every
+    cfg.live_view_camera = args.live_view_cam
+    cfg.live_view_max_size = args.live_view_max_size
     cfg.device          = str(device)
 
     trainer = TexturePPISPTrainer(scene, cfg)

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional, List, Callable
 
 import torch
+import torch.nn as nn
 import torch.optim as optim
 from PIL import Image
 import numpy as np
@@ -51,6 +52,16 @@ class TrainConfig:
     device:           str   = "cuda" if torch.cuda.is_available() else "cpu"
     seed:             int   = 42
     learn_vignette:   bool  = True
+    learn_geometry:   bool  = False
+    lr_geometry:      float = 1e-4
+    geometry_warmup_iters: int = 1000
+    geom_reg_l2_weight:    float = 1e-3
+    geom_reg_edge_weight:  float = 1e-2
+    max_vertex_offset:     Optional[float] = 0.03
+    live_view:             bool  = False
+    live_view_every:       int   = 50
+    live_view_camera:      int   = 0
+    live_view_max_size:    int   = 1200
 
 
 # ---------------------------------------------------------------------------
@@ -68,10 +79,25 @@ class TexturePPISPTrainer:
         random.seed(config.seed)
         Path(config.output_dir).mkdir(parents=True, exist_ok=True)
 
-        # ---- Mesh (fixed, no grad) ----
-        self.vertices = scene.mesh.vertices.to(self.device)
+        # ---- Mesh ----
+        self.base_vertices = scene.mesh.vertices.to(self.device)
         self.faces    = scene.mesh.faces.to(self.device)
         self.uvs      = scene.mesh.uvs.to(self.device)
+
+        # Optional geometry branch: optimise per-vertex offsets from COLMAP mesh.
+        self.learn_geometry = bool(config.learn_geometry)
+        self.vertex_offsets = nn.Parameter(
+            torch.zeros_like(self.base_vertices),
+            requires_grad=self.learn_geometry,
+        )
+        self._max_vertex_offset = config.max_vertex_offset
+        self._edges = self._build_unique_edges(self.faces)
+        if self._edges is not None and self._edges.shape[0] > 0:
+            v0 = self.base_vertices[self._edges[:, 0]]
+            v1 = self.base_vertices[self._edges[:, 1]]
+            self._base_edge_lengths = (v0 - v1).norm(dim=1).detach()
+        else:
+            self._base_edge_lengths = None
 
         # ---- Texture ----
         self.texture = TextureMap(
@@ -116,19 +142,240 @@ class TexturePPISPTrainer:
                                     betas=(0.9, 0.99), eps=1e-15)
         self.opt_ppisp = optim.Adam(self.ppisp.parameters(),
                                     lr=config.lr_ppisp)
+        self.opt_geom  = (optim.Adam([self.vertex_offsets], lr=config.lr_geometry)
+                  if self.learn_geometry else None)
 
         self.iter     = 0
         self.loss_log: List[dict] = []
 
+        self._cv2 = None
+        self._live_view_enabled = False
+        self._live_view_window = "TextureOptimizer Live"
+        self._live_view_cam = 0
+        self._live_view_selector_root = None
+        self._live_view_selector_var = None
+        self._init_live_viewer()
+
         n_tex   = sum(p.numel() for p in self.texture.parameters())
         n_ppisp = sum(p.numel() for p in self.ppisp.parameters())
+        n_geom  = int(self.vertex_offsets.numel()) if self.learn_geometry else 0
         print(f"\n[Trainer] Device    : {self.device}")
         print(f"[Trainer] Backend   : {'nvdiffrast' if self.rasterizer.uses_nvdiffrast else 'software (SLOW)'}")
         print(f"[Trainer] Cameras   : {len(scene)}")
-        print(f"[Trainer] Mesh      : {self.vertices.shape[0]:,} verts, {self.faces.shape[0]:,} faces")
+        print(f"[Trainer] Mesh      : {self.base_vertices.shape[0]:,} verts, {self.faces.shape[0]:,} faces")
         print(f"[Trainer] Texture   : {config.tex_H}×{config.tex_W}  ({n_tex/1e6:.1f}M params)")
         print(f"[Trainer] PPISP     : {n_ppisp} params  ({len(scene)} cameras)")
+        print(f"[Trainer] Geometry  : {'on' if self.learn_geometry else 'off'}"
+              f"{f'  ({n_geom/1e6:.1f}M offset params)' if self.learn_geometry else ''}")
         print(f"[Trainer] Iterations: {config.num_iterations}")
+
+    def _init_live_viewer(self):
+        cfg = self.cfg
+        if not cfg.live_view:
+            return
+        try:
+            import cv2
+            self._cv2 = cv2
+        except Exception as e:
+            print(f"[LiveView] OpenCV unavailable ({e}). Disable live view or install opencv-python.")
+            return
+
+        if len(self.scene.views) == 0:
+            print("[LiveView] No cameras available.")
+            return
+
+        self._live_view_cam = int(max(0, min(cfg.live_view_camera, len(self.scene.views) - 1)))
+        self._live_view_enabled = True
+        self._cv2.namedWindow(self._live_view_window, self._cv2.WINDOW_NORMAL)
+        print("[LiveView] Enabled: dropdown select camera, keys n/] next cam, p/[ prev cam, q or ESC to close")
+
+        # Optional dropdown camera selector window (Tkinter).
+        self._init_live_view_dropdown()
+
+    def _init_live_view_dropdown(self):
+        try:
+            import tkinter as tk
+            from tkinter import ttk
+        except Exception:
+            print("[LiveView] Tkinter unavailable; dropdown selector disabled.")
+            return
+
+        try:
+            root = tk.Tk()
+            root.title("Camera Selector")
+            root.geometry("300x90")
+            root.resizable(False, False)
+
+            ttk.Label(root, text="Live camera").pack(anchor="w", padx=10, pady=(8, 2))
+            options = [f"cam_{i:04d}" for i in range(len(self.scene.views))]
+            var = tk.StringVar(value=options[self._live_view_cam])
+
+            combo = ttk.Combobox(root, textvariable=var, values=options, state="readonly")
+            combo.pack(fill="x", padx=10)
+
+            def _on_select(_event=None):
+                value = var.get()
+                if value.startswith("cam_"):
+                    try:
+                        self._live_view_cam = int(value.split("_", 1)[1])
+                    except Exception:
+                        pass
+
+            combo.bind("<<ComboboxSelected>>", _on_select)
+
+            ttk.Label(root, text="Close this window or press q in preview to disable live view.").pack(
+                anchor="w", padx=10, pady=(6, 0)
+            )
+
+            self._live_view_selector_root = root
+            self._live_view_selector_var = var
+        except Exception as e:
+            self._live_view_selector_root = None
+            self._live_view_selector_var = None
+            print(f"[LiveView] Could not create dropdown selector: {e}")
+
+    def _poll_live_view_keys(self, key: int):
+        if key < 0 or not self._live_view_enabled:
+            return
+        key_lo = key & 0xFF
+        quit_codes = {27, ord("q")}
+        next_codes = {ord("n"), ord("]"), 83, 2555904}
+        prev_codes = {ord("p"), ord("["), 81, 2424832}
+
+        if key in quit_codes or key_lo in quit_codes:
+            self._live_view_enabled = False
+            try:
+                self._cv2.destroyWindow(self._live_view_window)
+            except Exception:
+                pass
+            print("[LiveView] Closed.")
+            return
+
+        if key in next_codes or key_lo in next_codes:
+            self._live_view_cam = (self._live_view_cam + 1) % len(self.scene.views)
+            print(f"[LiveView] Camera -> {self._live_view_cam}")
+        elif key in prev_codes or key_lo in prev_codes:
+            self._live_view_cam = (self._live_view_cam - 1) % len(self.scene.views)
+            print(f"[LiveView] Camera -> {self._live_view_cam}")
+
+        if self._live_view_selector_var is not None:
+            self._live_view_selector_var.set(f"cam_{self._live_view_cam:04d}")
+
+    def _poll_live_view_events(self):
+        if not self._live_view_enabled or self._cv2 is None:
+            return
+
+        # Process OpenCV events every iteration to keep the window responsive.
+        key_fn = getattr(self._cv2, "waitKeyEx", self._cv2.waitKey)
+        key = key_fn(1)
+        self._poll_live_view_keys(key)
+
+        # Pump Tkinter events so dropdown stays responsive.
+        if self._live_view_selector_root is not None:
+            try:
+                self._live_view_selector_root.update_idletasks()
+                self._live_view_selector_root.update()
+            except Exception:
+                self._live_view_selector_root = None
+                self._live_view_selector_var = None
+
+    def _update_live_view(self, losses: dict):
+        if not self._live_view_enabled or self._cv2 is None:
+            return
+        if self.cfg.live_view_every <= 0:
+            return
+        if (self.iter + 1) % self.cfg.live_view_every != 0:
+            return
+
+        view = self.scene.views[self._live_view_cam]
+        with torch.no_grad():
+            pred = self.render_view(view).detach().clamp(0, 1).cpu().numpy()
+        gt = view.gt_image
+        if gt is not None:
+            gt_np = gt.detach().cpu().numpy() if torch.is_tensor(gt) else np.asarray(gt)
+            panel = np.concatenate([pred, gt_np], axis=1)
+        else:
+            panel = pred
+
+        img = (np.clip(panel, 0, 1) * 255.0).astype(np.uint8)
+
+        max_size = max(64, int(self.cfg.live_view_max_size))
+        h, w = img.shape[:2]
+        scale = min(1.0, max_size / float(max(h, w)))
+        if scale < 1.0:
+            new_w = max(1, int(w * scale))
+            new_h = max(1, int(h * scale))
+            img = self._cv2.resize(img, (new_w, new_h), interpolation=self._cv2.INTER_AREA)
+
+        bgr = self._cv2.cvtColor(img, self._cv2.COLOR_RGB2BGR)
+        label = f"iter={self.iter+1} cam={self._live_view_cam} loss={losses.get('total', 0.0):.4f}"
+        self._cv2.putText(
+            bgr, label, (12, 28), self._cv2.FONT_HERSHEY_SIMPLEX,
+            0.75, (50, 220, 50), 2, self._cv2.LINE_AA
+        )
+        self._cv2.putText(
+            bgr, "left: pred, right: gt", (12, 56), self._cv2.FONT_HERSHEY_SIMPLEX,
+            0.6, (220, 220, 220), 1, self._cv2.LINE_AA
+        )
+
+        self._cv2.imshow(self._live_view_window, bgr)
+
+    def _close_live_view(self):
+        if self._live_view_selector_root is not None:
+            try:
+                self._live_view_selector_root.destroy()
+            except Exception:
+                pass
+            self._live_view_selector_root = None
+            self._live_view_selector_var = None
+
+        if self._cv2 is None:
+            return
+        try:
+            self._cv2.destroyWindow(self._live_view_window)
+        except Exception:
+            pass
+
+    def _build_unique_edges(self, faces: torch.Tensor) -> Optional[torch.Tensor]:
+        if faces.numel() == 0:
+            return None
+        e01 = faces[:, [0, 1]]
+        e12 = faces[:, [1, 2]]
+        e20 = faces[:, [2, 0]]
+        edges = torch.cat([e01, e12, e20], dim=0)
+        edges = torch.sort(edges, dim=1).values
+        return torch.unique(edges, dim=0)
+
+    def current_vertices(self) -> torch.Tensor:
+        if not self.learn_geometry:
+            return self.base_vertices
+        if self._max_vertex_offset is None:
+            offsets = self.vertex_offsets
+        else:
+            offsets = torch.tanh(self.vertex_offsets) * float(self._max_vertex_offset)
+        return self.base_vertices + offsets
+
+    def _geometry_regularization(self, vertices: torch.Tensor) -> dict:
+        if (not self.learn_geometry or self._edges is None or
+                self._base_edge_lengths is None or self._edges.shape[0] == 0):
+            zero = torch.tensor(0.0, device=self.device)
+            return {"geom_l2": zero, "geom_edge": zero, "geom_reg": zero}
+
+        disp = vertices - self.base_vertices
+        geom_l2 = disp.pow(2).mean()
+
+        v0 = vertices[self._edges[:, 0]]
+        v1 = vertices[self._edges[:, 1]]
+        edge_len = (v0 - v1).norm(dim=1)
+        geom_edge = (edge_len - self._base_edge_lengths).abs().mean()
+
+        geom_reg = (self.cfg.geom_reg_l2_weight * geom_l2
+                    + self.cfg.geom_reg_edge_weight * geom_edge)
+        return {
+            "geom_l2": geom_l2,
+            "geom_edge": geom_edge,
+            "geom_reg": geom_reg,
+        }
 
     # ------------------------------------------------------------------
     # Render
@@ -151,7 +398,7 @@ class TexturePPISPTrainer:
                 self.ppisp.r2 = gx**2 + gy**2
 
         hdr = self.rasterizer.render(
-            self.vertices, self.faces, self.uvs,
+            self.current_vertices(), self.faces, self.uvs,
             self.texture, R, t, K, W, H,
         )
         return self.ppisp(hdr, ci)
@@ -170,21 +417,36 @@ class TexturePPISPTrainer:
         for p in self.texture.parameters():
             p.requires_grad_(train_tex)
 
+        train_geom = self.learn_geometry and (self.iter >= self.cfg.geometry_warmup_iters)
+        self.vertex_offsets.requires_grad_(train_geom)
+
         self.opt_tex.zero_grad()
         self.opt_ppisp.zero_grad()
+        if self.opt_geom is not None:
+            self.opt_geom.zero_grad()
 
         pred   = self.render_view(view)
         losses = self.loss_fn(pred, gt, self.texture, self.ppisp)
-        losses["total"].backward()
+        geom_losses = self._geometry_regularization(self.current_vertices())
+        total = losses["total"] + geom_losses["geom_reg"]
+        total.backward()
 
         torch.nn.utils.clip_grad_norm_(self.ppisp.parameters(), 1.0)
         if train_tex:
             torch.nn.utils.clip_grad_norm_(self.texture.parameters(), 1.0)
             self.opt_tex.step()
+        if train_geom and self.opt_geom is not None:
+            torch.nn.utils.clip_grad_norm_([self.vertex_offsets], 1.0)
+            self.opt_geom.step()
         self.opt_ppisp.step()
 
+        out = {
+            "total": total,
+            **losses,
+            **geom_losses,
+        }
         return {k: v.item() if hasattr(v, "item") else v
-                for k, v in losses.items()}
+                for k, v in out.items()}
 
     # ------------------------------------------------------------------
     # LR schedule
@@ -198,6 +460,9 @@ class TexturePPISPTrainer:
                 1 + math.cos(math.pi * t))
             for g in self.opt_tex.param_groups:   g["lr"] = cfg.lr_texture * f
             for g in self.opt_ppisp.param_groups: g["lr"] = cfg.lr_ppisp   * f
+            if self.opt_geom is not None:
+                for g in self.opt_geom.param_groups:
+                    g["lr"] = cfg.lr_geometry * f
 
     # ------------------------------------------------------------------
     # Train loop
@@ -213,13 +478,17 @@ class TexturePPISPTrainer:
         print(f"\n[Trainer] ▶  Starting {cfg.num_iterations} iterations  "
               f"({cfg.warmup_iters} warmup) ...\n")
 
-        running = {k: 0.0 for k in ("total", "photo", "tex_reg", "ppisp_reg")}
+        running = {k: 0.0 for k in (
+            "total", "photo", "tex_reg", "ppisp_reg", "geom_reg", "geom_l2", "geom_edge"
+        )}
         t_iter  = time.time()
 
         for self.iter in range(cfg.num_iterations):
             view   = random.choice(views)
             losses = self.step(view)
             self._update_lr()
+            self._poll_live_view_events()
+            self._update_live_view(losses)
 
             for k in running:
                 running[k] += losses.get(k, 0.0)
@@ -228,12 +497,20 @@ class TexturePPISPTrainer:
             if (self.iter + 1) % cfg.log_every == 0:
                 it_per_s = cfg.log_every / max(time.time() - t_iter, 1e-6)
                 eta_s    = (cfg.num_iterations - self.iter - 1) / max(it_per_s, 1e-6)
-                mode     = "warmup" if self.iter < cfg.warmup_iters else "joint"
+                if self.iter < cfg.warmup_iters:
+                    mode = "warmup"
+                elif self.learn_geometry and self.iter < cfg.geometry_warmup_iters:
+                    mode = "joint-no-geom"
+                else:
+                    mode = "joint"
                 avg      = {k: v / cfg.log_every for k, v in running.items()}
+                geom_txt = (f"  geom={avg['geom_reg']:.5f}"
+                            if self.learn_geometry else "")
                 print(
                     f"  {self.iter+1:5d}/{cfg.num_iterations}  [{mode}]  "
                     f"loss={avg['total']:.4f}  photo={avg['photo']:.4f}  "
                     f"tex_reg={avg['tex_reg']:.5f}  "
+                    f"{geom_txt} "
                     f"{it_per_s:.1f} it/s  ETA {eta_s/60:.1f}m"
                 )
                 running = {k: 0.0 for k in running}
@@ -245,6 +522,7 @@ class TexturePPISPTrainer:
                 self._save_checkpoint(self.iter + 1)
 
         print(f"\n[Trainer] ✓  Done in {(time.time()-t0)/60:.1f} min")
+        self._close_live_view()
         self.ppisp.print_summary()
 
     # ------------------------------------------------------------------
@@ -259,9 +537,25 @@ class TexturePPISPTrainer:
             "ppisp":      self.ppisp.state_dict(),
             "opt_tex":    self.opt_tex.state_dict(),
             "opt_ppisp":  self.opt_ppisp.state_dict(),
+            "vertex_offsets": self.vertex_offsets.detach().cpu() if self.learn_geometry else None,
+            "opt_geom":   self.opt_geom.state_dict() if self.opt_geom is not None else None,
             "loss_log":   self.loss_log,
         }, path)
+        # Keep only the most recent checkpoint file to limit disk usage.
+        self._prune_old_checkpoints(path)
         print(f"  [ckpt] → {path}")
+
+    def _prune_old_checkpoints(self, keep_path: str):
+        keep_abs = os.path.abspath(keep_path)
+        out_dir = Path(self.cfg.output_dir)
+        for ckpt_path in out_dir.glob("checkpoint_*.pt"):
+            ckpt_abs = os.path.abspath(str(ckpt_path))
+            if ckpt_abs == keep_abs:
+                continue
+            try:
+                ckpt_path.unlink()
+            except OSError as e:
+                print(f"  [ckpt] WARNING: could not remove old checkpoint {ckpt_path}: {e}")
 
     def load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
@@ -269,9 +563,44 @@ class TexturePPISPTrainer:
         self.ppisp.load_state_dict(ckpt["ppisp"])
         self.opt_tex.load_state_dict(ckpt["opt_tex"])
         self.opt_ppisp.load_state_dict(ckpt["opt_ppisp"])
+        if self.learn_geometry and ckpt.get("vertex_offsets") is not None:
+            with torch.no_grad():
+                self.vertex_offsets.copy_(ckpt["vertex_offsets"].to(self.device))
+            if self.opt_geom is not None and ckpt.get("opt_geom") is not None:
+                self.opt_geom.load_state_dict(ckpt["opt_geom"])
         self.iter     = ckpt["iteration"]
         self.loss_log = ckpt.get("loss_log", [])
         print(f"[Trainer] Loaded checkpoint iter {self.iter}: {path}")
+
+    def _export_mesh_obj(self, path: str):
+        mtl_name = "optimized_mesh.mtl"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# Exported by texture_optimizer\\n")
+            f.write(f"mtllib {mtl_name}\\n")
+            f.write("usemtl material_0\\n")
+
+            verts = self.current_vertices().detach().cpu().numpy()
+            uvs = self.uvs.detach().cpu().numpy()
+            faces = self.faces.detach().cpu().numpy()
+
+            for v in verts:
+                f.write(f"v {float(v[0]):.9f} {float(v[1]):.9f} {float(v[2]):.9f}\\n")
+            for uv in uvs:
+                # OBJ V grows upward; our UV convention is image-space top-down.
+                f.write(f"vt {float(uv[0]):.9f} {1.0 - float(uv[1]):.9f}\\n")
+            for tri in faces:
+                a, b, c = int(tri[0]) + 1, int(tri[1]) + 1, int(tri[2]) + 1
+                f.write(f"f {a}/{a} {b}/{b} {c}/{c}\\n")
+
+        mtl_path = os.path.join(os.path.dirname(path), mtl_name)
+        with open(mtl_path, "w", encoding="utf-8") as f:
+            f.write("newmtl material_0\\n")
+            f.write("Ka 1.000000 1.000000 1.000000\\n")
+            f.write("Kd 1.000000 1.000000 1.000000\\n")
+            f.write("Ks 0.000000 0.000000 0.000000\\n")
+            f.write("d 1.0\\n")
+            f.write("illum 2\\n")
+            f.write("map_Kd optimized_texture.png\\n")
 
     def export_results(self):
         out = self.cfg.output_dir
@@ -288,6 +617,11 @@ class TexturePPISPTrainer:
             json.dump([self.ppisp.get_params_dict(i)
                        for i in range(len(self.scene))], f, indent=2)
         print(f"[Export] PPISP    → {out}/ppisp_params.json")
+
+        # Optimized geometry (OBJ + MTL + texture reference)
+        mesh_obj = os.path.join(out, "optimized_mesh.obj")
+        self._export_mesh_obj(mesh_obj)
+        print(f"[Export] Mesh     → {mesh_obj}")
 
         # Loss curve
         np.save(os.path.join(out, "loss_log.npy"),
