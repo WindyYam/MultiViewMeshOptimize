@@ -51,8 +51,14 @@ def parse_args():
                    help="Geometry (vertex offsets) learning rate")
     p.add_argument("--warmup",      type=int,   default=500,
                    help="Warmup iterations (PPISP only, texture frozen)")
+    p.add_argument("--tex_update_every", type=int, default=1,
+                   help="Update texture every N iterations after warmup")
     p.add_argument("--geom_warmup", type=int,   default=1000,
                    help="Warmup iterations before geometry updates start")
+    p.add_argument("--geom_update_every", type=int, default=1,
+                   help="Update geometry every N iterations after geom warmup")
+    p.add_argument("--geom_smooth_every", type=int, default=2,
+                   help="Compute geometry smoothness every N geometry-update iterations")
     p.add_argument("--learn_geometry", action="store_true",
                    help="Enable differentiable mesh geometry updates")
     p.add_argument("--geom_smooth", type=float, default=1e-2,
@@ -81,6 +87,12 @@ def parse_args():
                    help="Enable mixed precision acceleration on CUDA")
     p.add_argument("--amp_dtype", type=str, default="bf16", choices=["fp16", "bf16"],
                    help="AMP dtype to use when --amp is enabled")
+    p.add_argument("--no_amp_loss_fp32", action="store_true",
+                   help="Keep loss evaluation in AMP dtype (faster, less stable). Default computes losses in fp32")
+    p.add_argument("--amp_init_scale", type=float, default=1024.0,
+                   help="Initial GradScaler scale for fp16 AMP")
+    p.add_argument("--amp_growth_interval", type=int, default=2000,
+                   help="GradScaler growth interval for fp16 AMP")
     p.add_argument("--no_tf32", action="store_true",
                    help="Disable TF32 matmul/conv acceleration on CUDA")
     return p.parse_args()
@@ -107,6 +119,7 @@ def main():
         cfg.output_dir      = args.output
         cfg.tex_H = cfg.tex_W = 256
         cfg.warmup_iters    = min(50, args.iters // 10)
+        cfg.tex_update_every = max(1, args.tex_update_every)
         cfg.lr_texture      = args.lr_tex
         cfg.lr_ppisp        = args.lr_ppisp
         cfg.progressive_texture = args.progressive_tex
@@ -117,6 +130,8 @@ def main():
         cfg.learn_vignette  = not args.no_vignette
         cfg.learn_geometry  = args.learn_geometry
         cfg.geometry_warmup_iters = args.geom_warmup
+        cfg.geom_update_every = max(1, args.geom_update_every)
+        cfg.geom_smooth_every = max(1, args.geom_smooth_every)
         cfg.geom_smooth_weight = args.geom_smooth
         cfg.max_vertex_offset     = (args.max_vertex_offset
                          if args.max_vertex_offset > 0 else None)
@@ -127,6 +142,9 @@ def main():
         cfg.live_view_max_size = args.live_view_max_size
         cfg.use_amp         = args.amp
         cfg.amp_dtype       = args.amp_dtype
+        cfg.amp_loss_fp32   = not args.no_amp_loss_fp32
+        cfg.amp_init_scale  = args.amp_init_scale
+        cfg.amp_growth_interval = args.amp_growth_interval
         cfg.use_tf32        = not args.no_tf32
         cfg.device          = str(device)
         cfg.log_every       = max(1, args.iters // 30)
@@ -169,6 +187,7 @@ def main():
     else:
         cfg.tex_H = cfg.tex_W = args.tex_res
     cfg.warmup_iters    = args.warmup
+    cfg.tex_update_every = max(1, args.tex_update_every)
     cfg.lr_texture      = args.lr_tex
     cfg.lr_ppisp        = args.lr_ppisp
     cfg.progressive_texture = args.progressive_tex
@@ -179,6 +198,8 @@ def main():
     cfg.learn_vignette  = not args.no_vignette
     cfg.learn_geometry  = args.learn_geometry
     cfg.geometry_warmup_iters = args.geom_warmup
+    cfg.geom_update_every = max(1, args.geom_update_every)
+    cfg.geom_smooth_every = max(1, args.geom_smooth_every)
     cfg.geom_smooth_weight = args.geom_smooth
     cfg.max_vertex_offset     = (args.max_vertex_offset
                                  if args.max_vertex_offset > 0 else None)
@@ -189,6 +210,9 @@ def main():
     cfg.live_view_max_size = args.live_view_max_size
     cfg.use_amp         = args.amp
     cfg.amp_dtype       = args.amp_dtype
+    cfg.amp_loss_fp32   = not args.no_amp_loss_fp32
+    cfg.amp_init_scale  = args.amp_init_scale
+    cfg.amp_growth_interval = args.amp_growth_interval
     cfg.use_tf32        = not args.no_tf32
     cfg.device          = str(device)
 

@@ -34,6 +34,9 @@ from .dataset  import ColmapScene, CameraView
 class TrainConfig:
     num_iterations:   int   = 5_000
     warmup_iters:     int   = 500      # PPISP only, texture frozen
+    tex_update_every: int   = 1        # update texture every N iterations after warmup
+    geom_update_every:int   = 1        # update geometry every N iterations after geometry warmup
+    geom_smooth_every:int   = 1        # compute geometry smoothness every N geometry updates
 
     lr_texture:       float = 1e-3
     lr_ppisp:         float = 5e-3
@@ -73,6 +76,9 @@ class TrainConfig:
     live_view_max_size:    int   = 1200
     use_amp:               bool  = False
     amp_dtype:             str   = "fp16"   # fp16 or bf16
+    amp_loss_fp32:         bool  = True
+    amp_init_scale:        float = 1024.0
+    amp_growth_interval:   int   = 2000
     use_tf32:              bool  = True
 
 
@@ -184,9 +190,9 @@ class TexturePPISPTrainer:
 
         # ---- Optimizers ----
         self.opt_tex   = self._create_tex_optimizer()
-        self.opt_ppisp = optim.Adam(self.ppisp.parameters(),
-                                    lr=config.lr_ppisp)
-        self.opt_geom  = (optim.Adam([self.geometry_offsets], lr=config.lr_geometry)
+        self.opt_ppisp = self._create_adam(self.ppisp.parameters(),
+                           lr=config.lr_ppisp)
+        self.opt_geom  = (self._create_adam([self.geometry_offsets], lr=config.lr_geometry)
                   if self.learn_geometry else None)
 
         self.iter     = 0
@@ -222,6 +228,11 @@ class TexturePPISPTrainer:
             f"[Trainer] AMP       : {'on' if self._amp_enabled else 'off'}"
             f"{f' ({config.amp_dtype})' if self._amp_enabled else ''}"
         )
+        if self._amp_enabled:
+            print(
+                f"[Trainer] AMP opts  : loss_fp32={'on' if config.amp_loss_fp32 else 'off'}, "
+                f"init_scale={config.amp_init_scale:g}, growth_int={config.amp_growth_interval}"
+            )
         print(f"[Trainer] TF32      : {'on' if (self.device.type == 'cuda' and config.use_tf32) else 'off'}")
         print(f"[Trainer] PhotoLoss : L1={config.l1_weight:.2f}, SSIM={config.ssim_weight:.2f} ({config.ssim_backend})")
         if config.progressive_texture:
@@ -232,15 +243,38 @@ class TexturePPISPTrainer:
             )
         else:
             print("[Trainer] TexProg   : off")
+        print(
+            "[Trainer] UpdateFreq : "
+            f"tex every {max(1, int(config.tex_update_every))} it, "
+            f"geom every {max(1, int(config.geom_update_every))} it"
+        )
+        if self.learn_geometry:
+            print(f"[Trainer] GeomSmooth : every {max(1, int(config.geom_smooth_every))} geom updates")
         print(f"[Trainer] Iterations: {config.num_iterations}")
 
     def _create_tex_optimizer(self):
-        return optim.Adam(
+        return self._create_adam(
             self.texture.parameters(),
             lr=self.cfg.lr_texture,
             betas=(0.9, 0.99),
             eps=1e-15,
         )
+
+    def _create_adam(self, params, lr: float, betas=(0.9, 0.999), eps=1e-8):
+        kwargs = {
+            "lr": lr,
+            "betas": betas,
+            "eps": eps,
+        }
+        if self.device.type == "cuda":
+            try:
+                return optim.Adam(params, fused=True, **kwargs)
+            except Exception:
+                try:
+                    return optim.Adam(params, foreach=True, **kwargs)
+                except Exception:
+                    return optim.Adam(params, **kwargs)
+        return optim.Adam(params, **kwargs)
 
     def _build_tex_stage_iters(self, total_iters: int):
         if total_iters <= 2:
@@ -314,7 +348,13 @@ class TexturePPISPTrainer:
         else:
             self._amp_dtype = torch.float16
             self._amp_enabled = True
-            self._grad_scaler = torch.cuda.amp.GradScaler(enabled=True)
+            self._grad_scaler = torch.cuda.amp.GradScaler(
+                enabled=True,
+                init_scale=float(max(1.0, cfg.amp_init_scale)),
+                growth_interval=int(max(1, cfg.amp_growth_interval)),
+                backoff_factor=0.5,
+                growth_factor=2.0,
+            )
 
     def _autocast_ctx(self):
         if not self._amp_enabled or self.device.type != "cuda":
@@ -602,11 +642,20 @@ class TexturePPISPTrainer:
             raise ValueError(f"GT image not loaded for cam {view.cam_idx}")
         gt = gt.to(self.device, non_blocking=True)
 
-        train_tex = self.iter >= self.cfg.warmup_iters
+        tex_every = max(1, int(self.cfg.tex_update_every))
+        train_tex = (
+            self.iter >= self.cfg.warmup_iters
+            and ((self.iter - self.cfg.warmup_iters) % tex_every == 0)
+        )
         for p in self.texture.parameters():
             p.requires_grad_(train_tex)
 
-        train_geom = self.learn_geometry and (self.iter >= self.cfg.geometry_warmup_iters)
+        geom_every = max(1, int(self.cfg.geom_update_every))
+        train_geom = (
+            self.learn_geometry
+            and (self.iter >= self.cfg.geometry_warmup_iters)
+            and ((self.iter - self.cfg.geometry_warmup_iters) % geom_every == 0)
+        )
         self.geometry_offsets.requires_grad_(train_geom)
 
         self.opt_tex.zero_grad(set_to_none=True)
@@ -616,13 +665,46 @@ class TexturePPISPTrainer:
 
         with self._autocast_ctx():
             pred, mesh_mask = self.render_view(view, return_mask=True)
-            losses = self.loss_fn(pred, gt, self.texture, self.ppisp, mask=mesh_mask)
+
+        # Keep render in AMP, but evaluate objective in fp32 for stability.
+        if self._amp_enabled and self.cfg.amp_loss_fp32:
+            pred_loss = pred.float()
+            gt_loss = gt.float()
+        else:
+            pred_loss = pred
+            gt_loss = gt
+
+        losses = self.loss_fn(pred_loss, gt_loss, self.texture, self.ppisp, mask=mesh_mask)
+        do_geom_smooth = (
+            train_geom
+            and ((self.iter - self.cfg.geometry_warmup_iters) % max(1, int(self.cfg.geom_smooth_every)) == 0)
+        )
+        if do_geom_smooth:
             vertices_now = self.current_vertices()
             geom_smooth = self._geometry_smoothness_loss(vertices_now)
-            geom_smooth_w = float(self.cfg.geom_smooth_weight) if train_geom else 0.0
-            total = losses["total"] + geom_smooth_w * geom_smooth
-            geom_losses = {
-                "geom_smooth": geom_smooth,
+            geom_smooth_w = float(self.cfg.geom_smooth_weight)
+        else:
+            geom_smooth = torch.tensor(0.0, device=self.device)
+            geom_smooth_w = 0.0
+        total = losses["total"] + geom_smooth_w * geom_smooth
+        geom_losses = {
+            "geom_smooth": geom_smooth,
+        }
+
+        if not torch.isfinite(total):
+            self.opt_tex.zero_grad(set_to_none=True)
+            self.opt_ppisp.zero_grad(set_to_none=True)
+            if self.opt_geom is not None:
+                self.opt_geom.zero_grad(set_to_none=True)
+            if self._grad_scaler is not None:
+                cur_scale = float(self._grad_scaler.get_scale())
+                self._grad_scaler.update(new_scale=max(cur_scale * 0.5, 1.0))
+            return {
+                "total": float("nan"),
+                "photo": losses["photo"].detach().item(),
+                "tex_reg": losses["tex_reg"].detach().item(),
+                "ppisp_reg": losses["ppisp_reg"].detach().item(),
+                "geom_smooth": geom_smooth.detach().item(),
             }
 
         if self._grad_scaler is not None:
