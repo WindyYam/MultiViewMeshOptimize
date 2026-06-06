@@ -3,7 +3,6 @@ Loss functions for texture + per-camera PPISP optimization.
 
 Losses:
   - PhotometricLoss   : L1 + perceptual-style SSIM in LDR space
-  - TextureRegLoss    : TV (total variation) smoothness prior on texture
   - PPISPRegLoss      : soft regularisation to keep ISP params near identity
 """
 
@@ -159,25 +158,6 @@ class PhotometricLoss(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Texture regularisation  (total variation)
-# ---------------------------------------------------------------------------
-
-class TextureRegLoss(nn.Module):
-    """
-    Total variation smoothness regulariser on the texture map.
-    Penalises sharp high-frequency variations in the learned texture.
-    """
-
-    def forward(self, tex: torch.Tensor) -> torch.Tensor:
-        """
-        tex: (1, 3, H_tex, W_tex)
-        """
-        diff_h = tex[:, :, 1:, :] - tex[:, :, :-1, :]
-        diff_w = tex[:, :, :, 1:] - tex[:, :, :, :-1]
-        return diff_h.abs().mean() + diff_w.abs().mean()
-
-
-# ---------------------------------------------------------------------------
 # Per-camera ISP regularisation
 # ---------------------------------------------------------------------------
 
@@ -243,7 +223,6 @@ class TotalLoss(nn.Module):
     def __init__(
         self,
         photo_weight:      float = 1.0,
-        tex_reg_weight:    float = 1e-4,
         ppisp_reg_weight:  float = 1e-2,
         l1_weight:         float = 0.8,
         ssim_weight:       float = 0.2,
@@ -251,7 +230,6 @@ class TotalLoss(nn.Module):
     ):
         super().__init__()
         self.w_photo    = photo_weight
-        self.w_tex_reg  = tex_reg_weight
         self.w_ppisp    = ppisp_reg_weight
 
         self.photo_loss   = PhotometricLoss(
@@ -259,28 +237,23 @@ class TotalLoss(nn.Module):
             ssim_weight=ssim_weight,
             ssim_backend=ssim_backend,
         )
-        self.tex_reg      = TextureRegLoss()
         self.ppisp_reg    = PPISPRegLoss()
 
     def forward(
         self,
         pred:    torch.Tensor,
         target:  torch.Tensor,
-        texture: "TextureMap",
         ppisp:   "PPISPParams",
         mask:    Optional[torch.Tensor] = None,
     ) -> dict:
         photo = self.photo_loss(pred, target, mask)
-        t_reg = self.tex_reg(texture.tex)
         p_reg = self.ppisp_reg(ppisp)
 
         total = (self.w_photo   * photo
-               + self.w_tex_reg * t_reg
                + self.w_ppisp   * p_reg)
 
         return {
             "total":     total,
             "photo":     photo.detach(),
-            "tex_reg":   t_reg.detach(),
             "ppisp_reg": p_reg.detach(),
         }

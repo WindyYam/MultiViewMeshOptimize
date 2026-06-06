@@ -10,14 +10,14 @@ Quick start:
 
 from .ppisp    import PPISPParams
 from .renderer import TextureMap, Rasterizer, NvdiffrastRasterizer, SoftwareRasterizer
-from .losses   import TotalLoss, PhotometricLoss, TextureRegLoss, PPISPRegLoss
+from .losses   import TotalLoss, PhotometricLoss, PPISPRegLoss
 from .dataset  import ColmapScene, CameraView, MeshData, load_obj
 from .trainer  import TexturePPISPTrainer, TrainConfig, train_scene
 
 __all__ = [
     "PPISPParams",
     "TextureMap", "Rasterizer", "NvdiffrastRasterizer", "SoftwareRasterizer",
-    "TotalLoss", "PhotometricLoss", "TextureRegLoss", "PPISPRegLoss",
+    "TotalLoss", "PhotometricLoss", "PPISPRegLoss",
     "ColmapScene", "CameraView", "MeshData", "load_obj",
     "TexturePPISPTrainer", "TrainConfig", "train_scene",
 ]

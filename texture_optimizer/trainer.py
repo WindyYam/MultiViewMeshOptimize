@@ -44,7 +44,6 @@ class TrainConfig:
     lr_decay_iters:   Optional[int] = None
 
     photo_weight:     float = 1.0
-    tex_reg_weight:   float = 5e-5
     ppisp_reg_weight: float = 1e-2
     l1_weight:        float = 0.8
     ssim_weight:      float = 0.2
@@ -216,7 +215,6 @@ class TexturePPISPTrainer:
         # ---- Loss ----
         self.loss_fn = TotalLoss(
             photo_weight=config.photo_weight,
-            tex_reg_weight=config.tex_reg_weight,
             ppisp_reg_weight=config.ppisp_reg_weight,
             l1_weight=config.l1_weight,
             ssim_weight=config.ssim_weight,
@@ -871,7 +869,7 @@ class TexturePPISPTrainer:
             pred_loss = pred
             gt_loss = gt
 
-        losses = self.loss_fn(pred_loss, gt_loss, self.texture, self.ppisp, mask=mesh_mask)
+        losses = self.loss_fn(pred_loss, gt_loss, self.ppisp, mask=mesh_mask)
         do_geom_reg = train_geom
         if do_geom_reg:
             vertices_now = self.current_vertices()
@@ -896,7 +894,6 @@ class TexturePPISPTrainer:
             return {
                 "total": float("nan"),
                 "photo": losses["photo"].detach().item(),
-                "tex_reg": losses["tex_reg"].detach().item(),
                 "ppisp_reg": losses["ppisp_reg"].detach().item(),
                 "geom_normal_tv": geom_normal_tv.detach().item(),
             }
@@ -969,7 +966,7 @@ class TexturePPISPTrainer:
               f"({cfg.warmup_iters} warmup) ...\n")
 
         running = {k: 0.0 for k in (
-            "total", "photo", "tex_reg", "ppisp_reg", "geom_normal_tv"
+            "total", "photo", "ppisp_reg", "geom_normal_tv"
         )}
         t_iter  = time.time()
 
@@ -996,18 +993,17 @@ class TexturePPISPTrainer:
                     mode = "joint"
                 avg      = {k: v / cfg.log_every for k, v in running.items()}
                 w_photo = cfg.photo_weight * avg["photo"]
-                w_tex_reg = cfg.tex_reg_weight * avg["tex_reg"]
                 w_ppisp_reg = cfg.ppisp_reg_weight * avg["ppisp_reg"]
                 w_normal_tv = (float(cfg.geom_normal_tv_weight) * avg["geom_normal_tv"]
                                if self.learn_geometry and self.iter >= cfg.geometry_warmup_iters
                                else 0.0)
-                w_total = w_photo + w_tex_reg + w_ppisp_reg + w_normal_tv
+                w_total = w_photo + w_ppisp_reg + w_normal_tv
                 geom_txt = (f"w_nTV={w_normal_tv:.3e}"
                             if self.learn_geometry else "")
                 print(
                     f"  {self.iter+1:5d}/{cfg.num_iterations}  [{mode}]  "
                     f"w_loss={w_total:.4f}  w_photo={w_photo:.4f}  "
-                    f"w_tex_reg={w_tex_reg:.5f}  w_ppisp_reg={w_ppisp_reg:.5f}  "
+                    f"w_ppisp_reg={w_ppisp_reg:.5f}  "
                     f"{geom_txt} "
                     f"{it_per_s:.1f} it/s  ETA {eta_s/60:.1f}m"
                 )
