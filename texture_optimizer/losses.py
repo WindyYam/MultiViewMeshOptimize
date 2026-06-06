@@ -36,7 +36,12 @@ _SSIM_WINDOW: Optional[torch.Tensor] = None
 _SSIM_WIN_SIZE = 11
 
 
-def _ssim_loss_native(pred: torch.Tensor, target: torch.Tensor, data_range: float = 1.0) -> torch.Tensor:
+def _ssim_loss_native(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    data_range: float = 1.0,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """
     SSIM-based loss in [0, 1].  Lower is better.
     pred / target: (H, W, 3) float32 in [0, data_range]
@@ -68,16 +73,35 @@ def _ssim_loss_native(pred: torch.Tensor, target: torch.Tensor, data_range: floa
     denom = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
     ssim_map = ((2 * mu12 + C1) * (2 * sigma12 + C2)) / torch.clamp(denom, min=1e-8)
 
-    return 1.0 - ssim_map.mean()
+    if mask is None:
+        return 1.0 - ssim_map.mean()
+
+    valid = mask.to(device=pred.device, dtype=pred.dtype)
+    if valid.ndim == 2:
+        valid = valid.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+    elif valid.ndim == 3:
+        valid = valid.unsqueeze(0)               # (1,1,H,W) or (1,3,H,W)
+
+    if valid.shape[1] == 1:
+        valid = valid.expand(-1, ssim_map.shape[1], -1, -1)
+
+    denom = valid.sum().clamp(min=1e-8)
+    ssim_mean = (ssim_map * valid).sum() / denom
+    return 1.0 - ssim_mean
 
 
-def _ssim_loss_msssim(pred: torch.Tensor, target: torch.Tensor, data_range: float = 1.0) -> torch.Tensor:
+def _ssim_loss_msssim(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    data_range: float = 1.0,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """
     Fast SSIM path using pytorch_msssim if available.
     pred / target: (H, W, 3) float32 in [0, data_range]
     """
-    if msssim_ssim is None:
-        return _ssim_loss_native(pred, target, data_range=data_range)
+    if msssim_ssim is None or mask is not None:
+        return _ssim_loss_native(pred, target, data_range=data_range, mask=mask)
 
     p = pred.permute(2, 0, 1).unsqueeze(0)
     t = target.permute(2, 0, 1).unsqueeze(0)
@@ -120,16 +144,21 @@ class PhotometricLoss(nn.Module):
         self.ssim_weight = ssim_weight
         self.ssim_backend = ssim_backend
 
-    def _compute_ssim(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def _compute_ssim(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         backend = self.ssim_backend
         if backend == "msssim":
-            return _ssim_loss_msssim(pred, target)
+            return _ssim_loss_msssim(pred, target, mask=mask)
         if backend == "native":
-            return _ssim_loss_native(pred, target)
+            return _ssim_loss_native(pred, target, mask=mask)
         # auto: prefer accelerated backend when installed.
         if msssim_ssim is not None:
-            return _ssim_loss_msssim(pred, target)
-        return _ssim_loss_native(pred, target)
+            return _ssim_loss_msssim(pred, target, mask=mask)
+        return _ssim_loss_native(pred, target, mask=mask)
 
     def forward(
         self,
@@ -138,21 +167,16 @@ class PhotometricLoss(nn.Module):
         mask:   Optional[torch.Tensor] = None,  # (H, W) bool; None = all pixels
     ) -> torch.Tensor:
         if mask is not None:
-            valid = mask
-            if valid.any():
-                pred_m   = pred[valid]
-                target_m = target[valid]
-            else:
-                pred_m, target_m = pred, target
-            m = mask.to(dtype=pred.dtype).unsqueeze(-1)
-            pred_ssim = pred * m
-            target_ssim = target * m
+            valid = mask.bool()
+            if not valid.any():
+                return torch.zeros((), device=pred.device, dtype=pred.dtype)
+            pred_m   = pred[valid]
+            target_m = target[valid]
         else:
             pred_m, target_m = pred, target
-            pred_ssim, target_ssim = pred, target
 
         l1   = F.l1_loss(pred_m, target_m)
-        ssim = self._compute_ssim(pred_ssim, target_ssim)
+        ssim = self._compute_ssim(pred, target, mask=mask)
 
         return self.l1_weight * l1 + self.ssim_weight * ssim
 

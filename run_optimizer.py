@@ -42,12 +42,12 @@ def parse_args():
                    help="Texture optimizer (sgd reduces VRAM vs adam)")
     p.add_argument("--progressive_tex", action="store_true",
                    help="Use progressive texture upscaling during training (1/2 -> full)")
-    p.add_argument("--lr_tex",      type=float, default=1e-3,
+    p.add_argument("--lr_tex",      type=float, default=2e-3,
                    help="Texture learning rate")
     p.add_argument("--lr_ppisp",    type=float, default=5e-3,
                    help="PPISP learning rate")
     p.add_argument("--lr_decay_start", type=int, default=None,
-                   help="Iteration to start LR decay (default: auto at ~65% of total iters)")
+                   help="Iteration to start LR decay (default: auto at ~75%% of total iters)")
     p.add_argument("--lr_decay_iters", type=int, default=None,
                    help="Number of iterations over which LR decays (default: auto to end of run)")
     p.add_argument("--lr_decay_factor", type=float, default=0.1,
@@ -97,8 +97,8 @@ def parse_args():
                    help="Initial camera index for live view")
     p.add_argument("--live_view_max_size", type=int, default=1200,
                    help="Max preview width/height in pixels for live window")
-    p.add_argument("--amp", action="store_true", default=True,
-                   help="Enable mixed precision acceleration on CUDA (default: enabled)")
+    p.add_argument("--amp", action="store_true", default=False,
+                   help="Enable mixed precision acceleration on CUDA (default: disabled)")
     p.add_argument("--no_amp", action="store_false", dest="amp",
                    help="Disable mixed precision acceleration")
     p.add_argument("--amp_dtype", type=str, default="bf16", choices=["fp16", "bf16"],

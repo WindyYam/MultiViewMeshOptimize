@@ -40,7 +40,7 @@ class TrainConfig:
     lr_texture:       float = 1e-3
     lr_ppisp:         float = 5e-3
     lr_decay_start:   Optional[int] = None
-    lr_decay_factor:  float = 0.1
+    lr_decay_factor:  float = 0.2
     lr_decay_iters:   Optional[int] = None
 
     photo_weight:     float = 1.0
@@ -405,7 +405,7 @@ class TexturePPISPTrainer:
         total = max(1, int(self.cfg.num_iterations))
 
         if self.cfg.lr_decay_start is None:
-            start = int(round(0.65 * total))
+            start = int(round(0.7 * total))
         else:
             start = int(self.cfg.lr_decay_start)
         start = max(0, min(start, max(0, total - 1)))

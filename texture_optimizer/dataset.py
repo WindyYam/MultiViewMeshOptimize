@@ -913,11 +913,27 @@ class ColmapScene:
         print(f"[ColmapScene] Loading scene from: {self.root}")
 
         # --- Parse COLMAP  (pycolmap for .bin, text fallback) ---
-        sparse_dir = self.root / "sparse"
-        if not sparse_dir.exists():
-            sparse_dir = self.root / "sparse" / "0"
-        if not sparse_dir.exists():
-            raise FileNotFoundError(f"No sparse/ directory found under {self.root}")
+        def _has_colmap_sparse_files(d: Path) -> bool:
+            return (
+                ((d / "cameras.bin").exists() and (d / "images.bin").exists())
+                or ((d / "cameras.txt").exists() and (d / "images.txt").exists())
+            )
+
+        sparse_candidates = [self.root / "sparse", self.root / "sparse" / "0", self.root]
+        sparse_dir = None
+        for cand in sparse_candidates:
+            if cand.exists() and _has_colmap_sparse_files(cand):
+                sparse_dir = cand
+                break
+
+        if sparse_dir is None:
+            raise FileNotFoundError(
+                f"No COLMAP sparse files found under {self.root}. "
+                "Expected cameras/images .bin or .txt in sparse/, sparse/0, or scene root."
+            )
+
+        if sparse_dir == self.root:
+            print("[ColmapScene] sparse/ not found; using COLMAP files from scene root")
 
         colmap_imgs, colmap_cams = _load_colmap_sparse(str(sparse_dir))
 
@@ -926,6 +942,7 @@ class ColmapScene:
 
         # --- Build CameraView list ---
         self.views: List[CameraView] = []
+        skipped_missing_images = 0
         img_dir = self.root / "images"
 
         for idx, rec in enumerate(colmap_imgs):
@@ -946,14 +963,20 @@ class ColmapScene:
             ], dtype=torch.float32)
 
             img_path = str(img_dir / rec["name"])
+            if not os.path.exists(img_path):
+                skipped_missing_images += 1
+                continue
+
             view = CameraView(
-                cam_idx=idx,
+                cam_idx=len(self.views),
                 image_path=img_path,
                 R=R, t=t, K=K, W=W, H=H,
             )
             self.views.append(view)
 
         print(f"[ColmapScene]   {len(self.views)} cameras loaded")
+        if skipped_missing_images > 0:
+            print(f"[ColmapScene]   Skipped {skipped_missing_images} cameras with missing image files")
 
         # --- Load mesh ---
         self.mesh = _find_and_load_mesh(self.root, mesh_path)
@@ -974,7 +997,7 @@ class ColmapScene:
                 view.gt_image = load_image(view.image_path, view.W, view.H)
             else:
                 print(f"  WARNING: image not found: {view.image_path}")
-                view.gt_image = torch.zeros(view.H, view.W, 3)
+                view.gt_image = None
 
     def __len__(self):
         return len(self.views)
