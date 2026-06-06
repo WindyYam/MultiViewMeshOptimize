@@ -51,7 +51,7 @@ class TextureMap(nn.Module):
     def as_image(self) -> torch.Tensor:
         """(H_tex, W_tex, 3) float32 in [0,1], detached."""
         with torch.no_grad():
-            return torch.clamp(self.tex.squeeze(0).permute(1, 2, 0), 0, 1)
+            return torch.clamp(self.tex.squeeze(0).permute(1, 2, 0), 0, 1).float()
 
 
 # ---------------------------------------------------------------------------

@@ -55,6 +55,8 @@ class TrainConfig:
     progressive_texture: bool = False
     texture_dtype:    str   = "auto"   # auto, fp32, fp16, bf16
     tex_optimizer:    str   = "adam"   # adam, sgd
+    geometry_dtype:   str   = "auto"   # auto, fp32, fp16, bf16
+    geom_optimizer:   str   = "adam"   # adam, sgd
 
     log_every:        int   = 50
     save_every:       int   = 500
@@ -111,6 +113,7 @@ class TexturePPISPTrainer:
         self.base_vertices = scene.mesh.vertices.to(self.device)
         self.faces    = scene.mesh.faces.to(self.device)
         self.uvs      = scene.mesh.uvs.to(self.device)
+        self._geometry_dtype = self._resolve_geometry_dtype(config.geometry_dtype)
 
         # Optional geometry branch: optimise per-vertex offsets from COLMAP mesh.
         self.learn_geometry = bool(config.learn_geometry)
@@ -129,6 +132,7 @@ class TexturePPISPTrainer:
             torch.zeros(geom_shape, device=self.device, dtype=self.base_vertices.dtype),
             requires_grad=self.learn_geometry,
         )
+        self._cast_geometry_parameter()
         # Backward-compat alias for places that still refer to vertex_offsets.
         self.vertex_offsets = self.geometry_offsets
         self._max_vertex_offset = config.max_vertex_offset
@@ -158,7 +162,7 @@ class TexturePPISPTrainer:
         # ---- Texture ----
         self._full_tex_H = int(config.tex_H)
         self._full_tex_W = int(config.tex_W)
-        self._tex_stage_scales = (0.25, 0.5, 1.0)
+        self._tex_stage_scales = (0.5, 1.0)
         self._tex_stage_iters = self._build_tex_stage_iters(config.num_iterations)
         self._tex_stage = self._texture_stage_for_iter(0)
         init_tex_h, init_tex_w = self._stage_texture_resolution(self._tex_stage)
@@ -207,7 +211,7 @@ class TexturePPISPTrainer:
         self.opt_tex   = self._create_tex_optimizer()
         self.opt_ppisp = self._create_adam(self.ppisp.parameters(),
                            lr=config.lr_ppisp)
-        self.opt_geom  = (self._create_adam([self.geometry_offsets], lr=config.lr_geometry)
+        self.opt_geom  = (self._create_geom_optimizer()
                   if self.learn_geometry else None)
 
         self.iter     = 0
@@ -245,6 +249,12 @@ class TexturePPISPTrainer:
                 f"[Trainer] WeldGeom  : {'on' if self._weld_enabled else 'off'}"
                 f"  ({self._num_weld_groups:,} groups from {self.base_vertices.shape[0]:,} verts)"
             )
+            geom_mem = self._estimate_geometry_memory_bytes(n_geom)
+            print(
+                f"[Trainer] GeomOpt   : {str(config.geom_optimizer).lower()}  dtype={str(config.geometry_dtype).lower()}"
+                f" (active={str(self._geometry_dtype).split('.')[-1]})"
+            )
+            print(f"[Trainer] GeomMem≈  : {geom_mem/1024**2:.2f} MiB (param+grad+opt state)")
         print(
             f"[Trainer] AMP       : {'on' if self._amp_enabled else 'off'}"
             f"{f' ({config.amp_dtype})' if self._amp_enabled else ''}"
@@ -259,8 +269,7 @@ class TexturePPISPTrainer:
         if config.progressive_texture:
             print(
                 "[Trainer] TexProg   : on"
-                f"  1/4 until iter<{self._tex_stage_iters[0]},"
-                f" 1/2 until iter<{self._tex_stage_iters[1]}, full after"
+                f"  1/3 at half-res until iter<{self._tex_stage_iters}, 2/3 at full-res after"
             )
         else:
             print("[Trainer] TexProg   : off")
@@ -288,12 +297,30 @@ class TexturePPISPTrainer:
             eps=1e-15,
         )
 
+    def _create_geom_optimizer(self):
+        mode = str(self.cfg.geom_optimizer).lower()
+        if mode == "sgd":
+            return optim.SGD([self.geometry_offsets], lr=self.cfg.lr_geometry, momentum=0.0)
+        return self._create_adam([self.geometry_offsets], lr=self.cfg.lr_geometry)
+
     def _resolve_texture_dtype(self, mode: str):
         mode_l = str(mode).lower()
         if mode_l == "auto":
             if self.device.type == "cuda" and self._amp_enabled and self._amp_dtype is not None:
                 return self._amp_dtype
             return torch.float32
+        if mode_l == "fp16":
+            return torch.float16
+        if mode_l == "bf16":
+            return torch.bfloat16
+        return torch.float32
+
+    def _resolve_geometry_dtype(self, mode: str):
+        mode_l = str(mode).lower()
+        if mode_l == "auto":
+            if self.device.type == "cuda" and self._amp_enabled and self._amp_dtype is not None:
+                return self._amp_dtype
+            return self.base_vertices.dtype
         if mode_l == "fp16":
             return torch.float16
         if mode_l == "bf16":
@@ -310,12 +337,29 @@ class TexturePPISPTrainer:
             casted = self.texture.tex.detach().to(dtype=target_dtype)
         self.texture.tex = nn.Parameter(casted)
 
+    def _cast_geometry_parameter(self):
+        target_dtype = self._geometry_dtype
+        if self.device.type != "cuda" and target_dtype != torch.float32:
+            target_dtype = torch.float32
+        if self.geometry_offsets.dtype == target_dtype:
+            return
+        with torch.no_grad():
+            casted = self.geometry_offsets.detach().to(dtype=target_dtype)
+        self.geometry_offsets = nn.Parameter(casted, requires_grad=self.learn_geometry)
+        self.vertex_offsets = self.geometry_offsets
+
     def _estimate_texture_memory_bytes(self, n_tex: int) -> float:
         bpp = torch.finfo(self._texture_dtype).bits // 8
         mode = str(self.cfg.tex_optimizer).lower()
         # param + grad + optimizer state tensors
         state_mult = 2.0 if mode == "adam" else 0.0
         return float(n_tex) * float(bpp) * (2.0 + state_mult)
+
+    def _estimate_geometry_memory_bytes(self, n_geom: int) -> float:
+        bpp = torch.finfo(self.geometry_offsets.dtype).bits // 8
+        mode = str(self.cfg.geom_optimizer).lower()
+        state_mult = 2.0 if mode == "adam" else 0.0
+        return float(n_geom) * float(bpp) * (2.0 + state_mult)
 
     def _create_adam(self, params, lr: float, betas=(0.9, 0.999), eps=1e-8):
         kwargs = {
@@ -334,11 +378,9 @@ class TexturePPISPTrainer:
         return optim.Adam(params, **kwargs)
 
     def _build_tex_stage_iters(self, total_iters: int):
-        if total_iters <= 2:
-            return (1, 2)
-        t1 = max(1, total_iters // 3)
-        t2 = max(t1 + 1, (2 * total_iters) // 3)
-        return (t1, t2)
+        if total_iters <= 1:
+            return 1
+        return max(1, total_iters // 3)
 
     def _stage_texture_resolution(self, stage: int):
         scale = self._tex_stage_scales[max(0, min(stage, len(self._tex_stage_scales) - 1))]
@@ -349,11 +391,9 @@ class TexturePPISPTrainer:
     def _texture_stage_for_iter(self, iteration: int) -> int:
         if not self.cfg.progressive_texture:
             return len(self._tex_stage_scales) - 1
-        if iteration < self._tex_stage_iters[0]:
+        if iteration < self._tex_stage_iters:
             return 0
-        if iteration < self._tex_stage_iters[1]:
-            return 1
-        return 2
+        return 1
 
     def _set_texture_stage(self, stage: int):
         target_h, target_w = self._stage_texture_resolution(stage)
@@ -374,7 +414,7 @@ class TexturePPISPTrainer:
         self.texture.tex = nn.Parameter(tex_up)
         self.opt_tex = self._create_tex_optimizer()
         self._tex_stage = stage
-        print(f"[Trainer] Texture upscale -> {target_h}x{target_w} (stage {stage+1}/3)")
+        print(f"[Trainer] Texture upscale -> {target_h}x{target_w} (stage {stage+1}/2)")
 
     def _maybe_update_texture_stage(self):
         target_stage = self._texture_stage_for_iter(self.iter)
@@ -538,7 +578,7 @@ class TexturePPISPTrainer:
 
         view = self.scene.views[self._live_view_cam]
         with torch.no_grad():
-            pred = self.render_view(view).detach().clamp(0, 1).cpu().numpy()
+            pred = self.render_view(view).detach().clamp(0, 1).float().cpu().numpy()
         gt = view.gt_image
         if gt is not None:
             gt_np = gt.detach().cpu().numpy() if torch.is_tensor(gt) else np.asarray(gt)
@@ -669,7 +709,7 @@ class TexturePPISPTrainer:
     def current_vertices(self) -> torch.Tensor:
         if not self.learn_geometry:
             return self.base_vertices
-        offsets_full = self._expanded_geometry_offsets()
+        offsets_full = self._expanded_geometry_offsets().to(dtype=self.base_vertices.dtype)
         if self._max_vertex_offset is None:
             offsets = offsets_full
         else:
@@ -1127,17 +1167,17 @@ class TexturePPISPTrainer:
                 np.array([l["total"] for l in self.loss_log]))
 
         # Re-render all views
-        render_dir = os.path.join(out, "renders")
-        os.makedirs(render_dir, exist_ok=True)
-        print("[Export] Re-rendering all views ...")
-        with torch.no_grad():
-            for view in self.scene.views:
-                if view.gt_image is None:
-                    continue
-                pred = self.render_view(view).cpu().numpy()
-                Image.fromarray((pred * 255).astype(np.uint8)).save(
-                    os.path.join(render_dir, f"cam_{view.cam_idx:04d}.png"))
-        print(f"[Export] Renders  → {render_dir}/")
+        # render_dir = os.path.join(out, "renders")
+        # os.makedirs(render_dir, exist_ok=True)
+        # print("[Export] Re-rendering all views ...")
+        # with torch.no_grad():
+        #     for view in self.scene.views:
+        #         if view.gt_image is None:
+        #             continue
+        #         pred = self.render_view(view).float().cpu().numpy()
+        #         Image.fromarray((pred * 255).astype(np.uint8)).save(
+        #             os.path.join(render_dir, f"cam_{view.cam_idx:04d}.png"))
+        # print(f"[Export] Renders  → {render_dir}/")
 
 
 # ---------------------------------------------------------------------------

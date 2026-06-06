@@ -39,8 +39,8 @@ def parse_args():
     p.add_argument("--tex_optimizer", type=str, default="adam", choices=["adam", "sgd"],
                    help="Texture optimizer (sgd reduces VRAM vs adam)")
     p.add_argument("--progressive_tex", action="store_true",
-                   help="Use progressive texture upscaling during training (1/4 -> 1/2 -> full)")
-    p.add_argument("--lr_tex",      type=float, default=2e-3,
+                   help="Use progressive texture upscaling during training (1/2 -> full)")
+    p.add_argument("--lr_tex",      type=float, default=1e-3,
                    help="Texture learning rate")
     p.add_argument("--lr_ppisp",    type=float, default=5e-3,
                    help="PPISP learning rate")
@@ -55,13 +55,17 @@ def parse_args():
                    help="Geometry (vertex offsets) learning rate")
     p.add_argument("--warmup",      type=int,   default=500,
                    help="Warmup iterations (PPISP only, texture frozen)")
-    p.add_argument("--tex_update_every", type=int, default=2,
+    p.add_argument("--tex_update_every", type=int, default=1,
                    help="Update texture every N iterations after warmup")
     p.add_argument("--geom_warmup", type=int,   default=500,
                    help="Warmup iterations before geometry updates start")
     p.add_argument("--geom_update_every", type=int, default=1,
                    help="Update geometry every N iterations after geom warmup")
-    p.add_argument("--geom_tv_weight", type=float, default=5e-2,
+    p.add_argument("--geom_dtype", type=str, default="auto", choices=["auto", "fp32", "fp16", "bf16"],
+                   help="Geometry offset dtype (auto follows AMP on CUDA; lowers VRAM when fp16/bf16)")
+    p.add_argument("--geom_optimizer", type=str, default="adam", choices=["adam", "sgd"],
+                   help="Geometry optimizer (sgd reduces VRAM vs adam)")
+    p.add_argument("--geom_tv_weight", type=float, default=5e-1,
                    help="Weight for geometry normal-TV regularization")
     p.add_argument("--learn_geometry", action="store_true",
                    help="Enable differentiable mesh geometry updates")
@@ -137,6 +141,8 @@ def main():
         cfg.learn_geometry  = args.learn_geometry
         cfg.geometry_warmup_iters = args.geom_warmup
         cfg.geom_update_every = max(1, args.geom_update_every)
+        cfg.geometry_dtype  = args.geom_dtype
+        cfg.geom_optimizer  = args.geom_optimizer
         cfg.geom_normal_tv_weight = args.geom_tv_weight
         cfg.max_vertex_offset     = (args.max_vertex_offset
                          if args.max_vertex_offset > 0 else None)
@@ -206,6 +212,8 @@ def main():
     cfg.learn_geometry  = args.learn_geometry
     cfg.geometry_warmup_iters = args.geom_warmup
     cfg.geom_update_every = max(1, args.geom_update_every)
+    cfg.geometry_dtype  = args.geom_dtype
+    cfg.geom_optimizer  = args.geom_optimizer
     cfg.geom_normal_tv_weight = args.geom_tv_weight
     cfg.max_vertex_offset     = (args.max_vertex_offset
                                  if args.max_vertex_offset > 0 else None)
