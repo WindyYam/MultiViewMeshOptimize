@@ -75,8 +75,6 @@ def parse_args():
                    help="Geometry optimizer (sgd reduces VRAM vs adam)")
     p.add_argument("--geom_tv_weight", type=float, default=5e-1,
                    help="Weight for geometry normal-TV regularization")
-    p.add_argument("--geom_face_uniform_weight", type=float, default=1e-3,
-                   help="Weight for face edge-length uniformity regularization")
     p.add_argument("--learn_geometry", action="store_true",
                    help="Enable differentiable mesh geometry updates")
     p.add_argument("--max_vertex_offset", type=float, default=0,
@@ -157,7 +155,6 @@ def main():
         cfg.geometry_dtype  = args.geom_dtype
         cfg.geom_optimizer  = args.geom_optimizer
         cfg.geom_normal_tv_weight = args.geom_tv_weight
-        cfg.geom_face_uniform_weight = args.geom_face_uniform_weight
         cfg.max_vertex_offset     = (args.max_vertex_offset
                          if args.max_vertex_offset > 0 else None)
         cfg.weld_geometry_vertices = not args.no_weld_geometry
@@ -234,7 +231,6 @@ def main():
     cfg.geometry_dtype  = args.geom_dtype
     cfg.geom_optimizer  = args.geom_optimizer
     cfg.geom_normal_tv_weight = args.geom_tv_weight
-    cfg.geom_face_uniform_weight = args.geom_face_uniform_weight
     cfg.max_vertex_offset     = (args.max_vertex_offset
                                  if args.max_vertex_offset > 0 else None)
     cfg.weld_geometry_vertices = not args.no_weld_geometry
