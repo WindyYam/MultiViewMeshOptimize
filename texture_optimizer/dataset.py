@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 
@@ -613,22 +614,28 @@ def _bake_vertex_colors_to_texture(
     Returns (res, res, 3) float32 in [0,1].
     Used to initialise the texture from a vertex-coloured PLY.
     """
-    tex    = torch.zeros(res, res, 3)
-    weight = torch.zeros(res, res)
-
+    # Vectorized splat of all face-vertex colors into UV texel bins.
     uv_px = uvs.clone()
     uv_px[:, 0] = uv_px[:, 0] * (res - 1)
     uv_px[:, 1] = (1.0 - uv_px[:, 1]) * (res - 1)  # flip V
 
-    for f in faces:
-        for vi in f:
-            px = int(uv_px[vi, 0].clamp(0, res-1).round())
-            py = int(uv_px[vi, 1].clamp(0, res-1).round())
-            tex[py, px]    += colors[vi]
-            weight[py, px] += 1.0
+    face_vidx = faces.reshape(-1).long()
+    px = uv_px[face_vidx, 0].round().clamp(0, res - 1).to(torch.int64)
+    py = uv_px[face_vidx, 1].round().clamp(0, res - 1).to(torch.int64)
+    lin = (py * res + px).cpu().numpy()
 
+    col_np = colors[face_vidx].cpu().numpy().astype(np.float32, copy=False)
+    tex_acc = np.zeros((res * res, 3), dtype=np.float32)
+    np.add.at(tex_acc, lin, col_np)
+
+    weight_flat = np.bincount(lin, minlength=res * res).astype(np.float32)
+    tex_flat = tex_acc
+    nz = weight_flat > 0
+    tex_flat[nz] /= weight_flat[nz, None]
+
+    tex = torch.from_numpy(tex_flat.reshape(res, res, 3))
+    weight = torch.from_numpy(weight_flat.reshape(res, res))
     mask = weight > 0
-    tex[mask] /= weight[mask].unsqueeze(-1)
     # Fill zero-weight texels with nearest non-zero (simple dilation)
     from PIL import Image as PILImage
     import numpy as np
@@ -762,6 +769,113 @@ def _find_and_load_mesh(scene_root, mesh_path=None):
     return mesh
 
 
+def _sample_texture_at_uvs(tex_image: torch.Tensor, uvs: torch.Tensor) -> torch.Tensor:
+    """Sample texture atlas at per-vertex UVs. Returns (V,3) in [0,1]."""
+    if tex_image is None:
+        raise ValueError("Cannot sample vertex colors: mesh has no texture image")
+    if tex_image.ndim != 3 or tex_image.shape[-1] != 3:
+        raise ValueError("Texture image must have shape (H, W, 3)")
+    if uvs.ndim != 2 or uvs.shape[1] != 2:
+        raise ValueError("UV tensor must have shape (V, 2)")
+
+    tex = tex_image.permute(2, 0, 1).unsqueeze(0).float()  # (1,3,H,W)
+    grid = uvs.float() * 2.0 - 1.0
+    grid[:, 1] = -grid[:, 1]
+    grid = grid.view(1, 1, -1, 2)  # (1,1,V,2)
+    sampled = F.grid_sample(
+        tex,
+        grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=False,
+    )  # (1,3,1,V)
+    return sampled.squeeze(0).squeeze(1).T.clamp(0.0, 1.0).contiguous()  # (V,3)
+
+
+def _unwrap_mesh_open3d_xatlas(mesh: MeshData, atlas_size: int) -> MeshData:
+    """
+    Re-unwrap mesh UVs with Open3D xatlas and initialize atlas from colors
+    sampled on the previous texture.
+    """
+    if mesh.faces.shape[0] == 0:
+        raise ValueError("Cannot unwrap a mesh without faces")
+    if mesh.tex_image is None:
+        raise ValueError("Cannot unwrap with texture transfer: input mesh has no texture")
+
+    try:
+        import open3d as o3d
+    except Exception as exc:
+        raise RuntimeError(
+            "open3d is required for xatlas unwrap mode. Install it with: pip install open3d"
+        ) from exc
+
+    atlas_size = int(max(32, atlas_size))
+    print(f"[ColmapScene] Re-unwrapping input mesh with Open3D xatlas (size={atlas_size})")
+
+    sampled_colors = _sample_texture_at_uvs(mesh.tex_image, mesh.uvs)
+
+    verts_np = mesh.vertices.detach().cpu().numpy().astype(np.float64, copy=False)
+    faces_np = mesh.faces.detach().cpu().numpy().astype(np.int32, copy=False)
+    colors_np = sampled_colors.detach().cpu().numpy().astype(np.float64, copy=False)
+
+    mesh_legacy = o3d.geometry.TriangleMesh()
+    mesh_legacy.vertices = o3d.utility.Vector3dVector(verts_np)
+    mesh_legacy.triangles = o3d.utility.Vector3iVector(faces_np)
+    mesh_legacy.vertex_colors = o3d.utility.Vector3dVector(colors_np)
+
+    tmesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh_legacy)
+    if not hasattr(tmesh, "compute_uvatlas"):
+        raise RuntimeError(
+            "This Open3D build does not expose compute_uvatlas(). "
+            "Please upgrade Open3D to a version with UVAtlas support."
+        )
+
+    tmesh.compute_uvatlas(size=atlas_size)
+    mesh_uv = tmesh.to_legacy()
+    if not mesh_uv.has_triangle_uvs():
+        raise RuntimeError("Open3D UVAtlas unwrap failed: no triangle UVs generated")
+
+    tri_uvs_np = np.asarray(mesh_uv.triangle_uvs, dtype=np.float32)
+    verts_uv_np = np.asarray(mesh_uv.vertices, dtype=np.float32)
+    faces_uv_np = np.asarray(mesh_uv.triangles, dtype=np.int64)
+    colors_uv_np = np.asarray(mesh_uv.vertex_colors, dtype=np.float32)
+
+    if tri_uvs_np.shape[0] != faces_uv_np.shape[0] * 3:
+        raise RuntimeError("UV unwrap output is inconsistent: triangle_uvs size mismatch")
+
+    tri_v = faces_uv_np.reshape(-1)
+    new_verts_np = verts_uv_np[tri_v]
+    new_cols_np = colors_uv_np[tri_v]
+    new_uvs_np = tri_uvs_np.reshape(-1, 2).copy()
+    # Keep internal convention aligned with existing loaders.
+    new_uvs_np[:, 1] = 1.0 - new_uvs_np[:, 1]
+
+    new_verts_t = torch.from_numpy(new_verts_np.astype(np.float32, copy=False))
+    new_uvs_t = torch.from_numpy(new_uvs_np.astype(np.float32, copy=False))
+    new_cols_t = torch.from_numpy(new_cols_np.astype(np.float32, copy=False))
+    num_faces = int(faces_uv_np.shape[0])
+    new_faces_t = torch.arange(num_faces * 3, dtype=torch.int64).reshape(num_faces, 3)
+
+    tex_image = _bake_vertex_colors_to_texture(
+        verts=new_verts_t,
+        faces=new_faces_t,
+        uvs=new_uvs_t,
+        colors=new_cols_t,
+        res=atlas_size,
+    )
+
+    print(
+        f"[ColmapScene] xatlas unwrap done: {new_verts_t.shape[0]} verts, "
+        f"{new_faces_t.shape[0]} faces, tex={tex_image.shape[1]}x{tex_image.shape[0]}"
+    )
+    return MeshData(
+        vertices=new_verts_t,
+        faces=new_faces_t,
+        uvs=new_uvs_t,
+        tex_image=tex_image,
+    )
+
+
 
 def load_image(path: str, W: int = None, H: int = None) -> torch.Tensor:
     """Load RGB image to float32 [0,1] tensor (H, W, 3)."""
@@ -788,6 +902,8 @@ class ColmapScene:
         image_scale:  float = 1.0,
         max_cameras:  Optional[int] = None,
         mesh_path:    Optional[str] = None,
+        uv_unwrap_mode: str = "none",
+        uv_unwrap_size: int = 0,
         device:       str = "cpu",
     ):
         self.root   = Path(scene_root)
@@ -841,6 +957,14 @@ class ColmapScene:
 
         # --- Load mesh ---
         self.mesh = _find_and_load_mesh(self.root, mesh_path)
+        unwrap_mode = str(uv_unwrap_mode or "none").lower()
+        if unwrap_mode in ("open3d_xatlas", "xatlas"):
+            unwrap_size = int(uv_unwrap_size)
+            if unwrap_size <= 0:
+                raise ValueError("uv_unwrap_size must be > 0 when uv_unwrap_mode is enabled")
+            self.mesh = _unwrap_mesh_open3d_xatlas(self.mesh, atlas_size=unwrap_size)
+        elif unwrap_mode != "none":
+            raise ValueError(f"Unknown uv_unwrap_mode='{uv_unwrap_mode}'")
 
     def load_gt_images(self):
         """Load all ground-truth images into memory (lazy call)."""

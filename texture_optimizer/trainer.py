@@ -39,9 +39,9 @@ class TrainConfig:
 
     lr_texture:       float = 1e-3
     lr_ppisp:         float = 5e-3
-    lr_decay_start:   int   = 3_000
+    lr_decay_start:   Optional[int] = None
     lr_decay_factor:  float = 0.1
-    lr_decay_iters:   int   = 2_000
+    lr_decay_iters:   Optional[int] = None
 
     photo_weight:     float = 1.0
     tex_reg_weight:   float = 5e-5
@@ -67,9 +67,8 @@ class TrainConfig:
     learn_geometry:   bool  = False
     lr_geometry:      float = 1e-4
     geometry_warmup_iters: int = 1000
-    geom_reg_l2_weight:    float = 1e-3
-    geom_reg_edge_weight:  float = 1e-2
     geom_normal_tv_weight: float = 5e-3
+    geom_face_uniform_weight: float = 1e-3
     geom_normal_tv_delta:  float = 1e-3
     geom_normal_tv_feature_sigma: float = 0.05
     geom_normal_tv_use_base_feature_weights: bool = True
@@ -224,6 +223,7 @@ class TexturePPISPTrainer:
         self._live_view_selector_root = None
         self._live_view_selector_var = None
         self._init_live_viewer()
+        self._lr_decay_start_eff, self._lr_decay_iters_eff = self._resolve_lr_decay_schedule()
 
         n_tex = sum(p.numel() for p in self.texture.parameters())
         n_ppisp = sum(p.numel() for p in self.ppisp.parameters())
@@ -266,6 +266,10 @@ class TexturePPISPTrainer:
             )
         print(f"[Trainer] TF32      : {'on' if (self.device.type == 'cuda' and config.use_tf32) else 'off'}")
         print(f"[Trainer] PhotoLoss : L1={config.l1_weight:.2f}, SSIM={config.ssim_weight:.2f} ({config.ssim_backend})")
+        print(
+            f"[Trainer] LRDecay   : start={self._lr_decay_start_eff}, "
+            f"iters={self._lr_decay_iters_eff}, factor={float(config.lr_decay_factor):.4f}"
+        )
         if config.progressive_texture:
             print(
                 "[Trainer] TexProg   : on"
@@ -280,7 +284,8 @@ class TexturePPISPTrainer:
         )
         if self.learn_geometry:
             print(
-                f"[Trainer] GeomPrior  : normal_tv={float(config.geom_normal_tv_weight):.4g}"
+                f"[Trainer] GeomPrior  : normal_tv={float(config.geom_normal_tv_weight):.4g}, "
+                f"face_uniform={float(config.geom_face_uniform_weight):.4g}"
             )
             n_adj = int(self._face_adj_pairs.shape[0]) if self._face_adj_pairs is not None else 0
             print(f"[Trainer] FaceAdj    : {n_adj:,} adjacent face pairs")
@@ -381,6 +386,22 @@ class TexturePPISPTrainer:
         if total_iters <= 1:
             return 1
         return max(1, total_iters // 3)
+
+    def _resolve_lr_decay_schedule(self):
+        total = max(1, int(self.cfg.num_iterations))
+
+        if self.cfg.lr_decay_start is None:
+            start = int(round(0.65 * total))
+        else:
+            start = int(self.cfg.lr_decay_start)
+        start = max(0, min(start, max(0, total - 1)))
+
+        if self.cfg.lr_decay_iters is None:
+            decay_iters = total - start
+        else:
+            decay_iters = int(self.cfg.lr_decay_iters)
+        decay_iters = max(1, decay_iters)
+        return start, decay_iters
 
     def _stage_texture_resolution(self, stage: int):
         scale = self._tex_stage_scales[max(0, min(stage, len(self._tex_stage_scales) - 1))]
@@ -716,28 +737,6 @@ class TexturePPISPTrainer:
             offsets = torch.tanh(offsets_full) * float(self._max_vertex_offset)
         return self.base_vertices + offsets
 
-    def _geometry_regularization(self, vertices: torch.Tensor) -> dict:
-        if (not self.learn_geometry or self._edges is None or
-                self._base_edge_lengths is None or self._edges.shape[0] == 0):
-            zero = torch.tensor(0.0, device=self.device)
-            return {"geom_l2": zero, "geom_edge": zero, "geom_reg": zero}
-
-        disp = vertices - self.base_vertices
-        geom_l2 = disp.pow(2).mean()
-
-        v0 = vertices[self._edges[:, 0]]
-        v1 = vertices[self._edges[:, 1]]
-        edge_len = (v0 - v1).norm(dim=1)
-        geom_edge = (edge_len - self._base_edge_lengths).abs().mean()
-
-        geom_reg = (self.cfg.geom_reg_l2_weight * geom_l2
-                    + self.cfg.geom_reg_edge_weight * geom_edge)
-        return {
-            "geom_l2": geom_l2,
-            "geom_edge": geom_edge,
-            "geom_reg": geom_reg,
-        }
-
     def _geometry_normal_tv_loss(self, vertices: torch.Tensor) -> torch.Tensor:
         """
         TV-like prior on face normals over adjacent faces.
@@ -779,6 +778,28 @@ class TexturePPISPTrainer:
             weights = weights * edge_len
 
         return (weights * tv).sum() / weights.sum().clamp(min=1e-8)
+
+    def _geometry_face_uniform_loss(self, vertices: torch.Tensor) -> torch.Tensor:
+        """
+        Penalize per-face edge-length variance to prefer triangles with
+        more uniform edge lengths (scale-invariant, averaged over faces).
+        """
+        if not self.learn_geometry or self.faces.numel() == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        f = self.faces
+        v0 = vertices[f[:, 0]]
+        v1 = vertices[f[:, 1]]
+        v2 = vertices[f[:, 2]]
+
+        l01 = (v0 - v1).norm(dim=1)
+        l12 = (v1 - v2).norm(dim=1)
+        l20 = (v2 - v0).norm(dim=1)
+        lengths = torch.stack([l01, l12, l20], dim=1)
+
+        mean_l = lengths.mean(dim=1, keepdim=True)
+        var_l = ((lengths - mean_l) ** 2).mean(dim=1)
+        return (var_l / (mean_l.squeeze(1) ** 2 + 1e-8)).mean()
 
     # ------------------------------------------------------------------
     # Render
@@ -858,12 +879,21 @@ class TexturePPISPTrainer:
             vertices_now = self.current_vertices()
             geom_normal_tv = self._geometry_normal_tv_loss(vertices_now)
             geom_normal_tv_w = float(self.cfg.geom_normal_tv_weight)
+            geom_face_uniform = self._geometry_face_uniform_loss(vertices_now)
+            geom_face_uniform_w = float(self.cfg.geom_face_uniform_weight)
         else:
             geom_normal_tv = torch.tensor(0.0, device=self.device)
             geom_normal_tv_w = 0.0
-        total = losses["total"] + geom_normal_tv_w * geom_normal_tv
+            geom_face_uniform = torch.tensor(0.0, device=self.device)
+            geom_face_uniform_w = 0.0
+        total = (
+            losses["total"]
+            + geom_normal_tv_w * geom_normal_tv
+            + geom_face_uniform_w * geom_face_uniform
+        )
         geom_losses = {
             "geom_normal_tv": geom_normal_tv,
+            "geom_face_uniform": geom_face_uniform,
         }
 
         if not torch.isfinite(total):
@@ -880,6 +910,7 @@ class TexturePPISPTrainer:
                 "tex_reg": losses["tex_reg"].detach().item(),
                 "ppisp_reg": losses["ppisp_reg"].detach().item(),
                 "geom_normal_tv": geom_normal_tv.detach().item(),
+                "geom_face_uniform": geom_face_uniform.detach().item(),
             }
 
         if self._grad_scaler is not None:
@@ -925,8 +956,8 @@ class TexturePPISPTrainer:
 
     def _update_lr(self):
         cfg = self.cfg
-        if self.iter >= cfg.lr_decay_start:
-            t = min((self.iter - cfg.lr_decay_start) / max(cfg.lr_decay_iters, 1), 1.0)
+        if self.iter >= self._lr_decay_start_eff:
+            t = min((self.iter - self._lr_decay_start_eff) / self._lr_decay_iters_eff, 1.0)
             f = cfg.lr_decay_factor + (1 - cfg.lr_decay_factor) * 0.5 * (
                 1 + math.cos(math.pi * t))
             for g in self.opt_tex.param_groups:   g["lr"] = cfg.lr_texture * f
@@ -950,7 +981,7 @@ class TexturePPISPTrainer:
               f"({cfg.warmup_iters} warmup) ...\n")
 
         running = {k: 0.0 for k in (
-            "total", "photo", "tex_reg", "ppisp_reg", "geom_normal_tv"
+            "total", "photo", "tex_reg", "ppisp_reg", "geom_normal_tv", "geom_face_uniform"
         )}
         t_iter  = time.time()
 
@@ -982,8 +1013,11 @@ class TexturePPISPTrainer:
                 w_normal_tv = (float(cfg.geom_normal_tv_weight) * avg["geom_normal_tv"]
                                if self.learn_geometry and self.iter >= cfg.geometry_warmup_iters
                                else 0.0)
-                w_total = w_photo + w_tex_reg + w_ppisp_reg + w_normal_tv
-                geom_txt = (f"w_nTV={w_normal_tv:.3e}"
+                w_face_uniform = (float(cfg.geom_face_uniform_weight) * avg["geom_face_uniform"]
+                                  if self.learn_geometry and self.iter >= cfg.geometry_warmup_iters
+                                  else 0.0)
+                w_total = w_photo + w_tex_reg + w_ppisp_reg + w_normal_tv + w_face_uniform
+                geom_txt = (f"w_nTV={w_normal_tv:.3e}  w_faceU={w_face_uniform:.3e}"
                             if self.learn_geometry else "")
                 print(
                     f"  {self.iter+1:5d}/{cfg.num_iterations}  [{mode}]  "
@@ -1099,6 +1133,7 @@ class TexturePPISPTrainer:
         Export textured mesh as binary little-endian PLY.
         Uses per-vertex UV properties and a TextureFile header comment.
         """
+        texture_ref = texture_file or "optimized_texture.png"
         verts = self.current_vertices().detach().cpu().numpy().astype(np.float32)
         uvs = self.uvs.detach().cpu().numpy().astype(np.float32)
         faces = self.faces.detach().cpu().numpy().astype(np.int32)
@@ -1114,25 +1149,53 @@ class TexturePPISPTrainer:
         uvs_out[:, 0] = np.clip(uvs_out[:, 0], 0.0, 1.0)
         uvs_out[:, 1] = np.clip(1.0 - uvs_out[:, 1], 0.0, 1.0)
 
-        vertex_block = np.concatenate([verts, uvs_out], axis=1).astype(np.float32, copy=False)
+        # Weld duplicated vertices by rounded XYZ to reduce seam duplication in output.
+        # UVs remain face-corner attributes (texcoord list), so seam UVs are preserved.
+        weld_decimals = max(0, int(getattr(self.cfg, "weld_position_decimals", 6)))
+        weld_keys = np.round(verts, decimals=weld_decimals)
+        _, unique_first_idx, inverse = np.unique(
+            weld_keys, axis=0, return_index=True, return_inverse=True
+        )
+        verts_weld = verts[unique_first_idx].astype(np.float32, copy=False)
+        faces_weld = inverse[faces].astype(np.int32, copy=False)
 
-        face_dtype = np.dtype([("n", np.uint8), ("idx", np.int32, (3,))])
-        face_block = np.empty(faces.shape[0], dtype=face_dtype)
+        # Keep only non-degenerate triangles after welding.
+        valid_face_mask = (
+            (faces_weld[:, 0] != faces_weld[:, 1])
+            & (faces_weld[:, 1] != faces_weld[:, 2])
+            & (faces_weld[:, 2] != faces_weld[:, 0])
+        )
+        faces_out = faces_weld[valid_face_mask]
+
+        vertex_block = verts_weld.astype(np.float32, copy=False)
+
+        # Face-level UV list layout: [u0, v0, u1, v1, u2, v2] per triangle.
+        tri_uv = uvs_out[faces].reshape(-1, 6).astype(np.float32, copy=False)
+        tri_uv_out = tri_uv[valid_face_mask]
+
+        face_dtype = np.dtype([
+            ("n", np.uint8),
+            ("idx", "<i4", (3,)),
+            ("tc_n", np.uint8),
+            ("tc", "<f4", (6,)),
+        ])
+        face_block = np.empty(faces_out.shape[0], dtype=face_dtype)
         face_block["n"] = 3
-        face_block["idx"] = faces
+        face_block["idx"] = faces_out
+        face_block["tc_n"] = 6
+        face_block["tc"] = tri_uv_out
 
         header = (
             "ply\n"
             "format binary_little_endian 1.0\n"
-            f"comment TextureFile {texture_file}\n"
-            f"element vertex {verts.shape[0]}\n"
+            f"comment TextureFile {texture_ref}\n"
+            f"element vertex {vertex_block.shape[0]}\n"
             "property float x\n"
             "property float y\n"
             "property float z\n"
-            "property float texture_u\n"
-            "property float texture_v\n"
-            f"element face {faces.shape[0]}\n"
+            f"element face {face_block.shape[0]}\n"
             "property list uchar int vertex_indices\n"
+            "property list uchar float texcoord\n"
             "end_header\n"
         )
 

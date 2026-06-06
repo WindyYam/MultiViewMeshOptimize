@@ -34,6 +34,8 @@ def parse_args():
                    help="GT image downscale factor (0.5 = half-res, faster)")
     p.add_argument("--tex_res",     type=int,   default=1024,
                    help="Target output texture long side (aspect ratio preserved from input texture when available)")
+    p.add_argument("--uv_unwrap", action="store_true",
+                   help="Run Open3D xatlas UV unwrap on input mesh before training")
     p.add_argument("--tex_dtype", type=str, default="auto", choices=["auto", "fp32", "fp16", "bf16"],
                    help="Texture parameter dtype (auto follows AMP on CUDA; lowers VRAM when fp16/bf16)")
     p.add_argument("--tex_optimizer", type=str, default="adam", choices=["adam", "sgd"],
@@ -44,6 +46,12 @@ def parse_args():
                    help="Texture learning rate")
     p.add_argument("--lr_ppisp",    type=float, default=5e-3,
                    help="PPISP learning rate")
+    p.add_argument("--lr_decay_start", type=int, default=None,
+                   help="Iteration to start LR decay (default: auto at ~65% of total iters)")
+    p.add_argument("--lr_decay_iters", type=int, default=None,
+                   help="Number of iterations over which LR decays (default: auto to end of run)")
+    p.add_argument("--lr_decay_factor", type=float, default=0.1,
+                   help="Final LR multiplier after cosine decay")
     p.add_argument("--l1_weight", type=float, default=0.8,
                    help="Photometric L1 weight")
     p.add_argument("--ssim_weight", type=float, default=0.2,
@@ -67,6 +75,8 @@ def parse_args():
                    help="Geometry optimizer (sgd reduces VRAM vs adam)")
     p.add_argument("--geom_tv_weight", type=float, default=5e-1,
                    help="Weight for geometry normal-TV regularization")
+    p.add_argument("--geom_face_uniform_weight", type=float, default=1e-3,
+                   help="Weight for face edge-length uniformity regularization")
     p.add_argument("--learn_geometry", action="store_true",
                    help="Enable differentiable mesh geometry updates")
     p.add_argument("--max_vertex_offset", type=float, default=0,
@@ -130,6 +140,9 @@ def main():
         cfg.tex_update_every = max(1, args.tex_update_every)
         cfg.lr_texture      = args.lr_tex
         cfg.lr_ppisp        = args.lr_ppisp
+        cfg.lr_decay_start  = args.lr_decay_start
+        cfg.lr_decay_iters  = args.lr_decay_iters
+        cfg.lr_decay_factor = args.lr_decay_factor
         cfg.progressive_texture = args.progressive_tex
         cfg.texture_dtype   = args.tex_dtype
         cfg.tex_optimizer   = args.tex_optimizer
@@ -144,6 +157,7 @@ def main():
         cfg.geometry_dtype  = args.geom_dtype
         cfg.geom_optimizer  = args.geom_optimizer
         cfg.geom_normal_tv_weight = args.geom_tv_weight
+        cfg.geom_face_uniform_weight = args.geom_face_uniform_weight
         cfg.max_vertex_offset     = (args.max_vertex_offset
                          if args.max_vertex_offset > 0 else None)
         cfg.weld_geometry_vertices = not args.no_weld_geometry
@@ -178,6 +192,8 @@ def main():
         image_scale=args.scale,
         max_cameras=args.max_cameras,
         mesh_path=args.mesh,
+        uv_unwrap_mode=("open3d_xatlas" if args.uv_unwrap else "none"),
+        uv_unwrap_size=args.tex_res,
         device=str(device),
     )
     scene.load_gt_images()
@@ -201,6 +217,9 @@ def main():
     cfg.tex_update_every = max(1, args.tex_update_every)
     cfg.lr_texture      = args.lr_tex
     cfg.lr_ppisp        = args.lr_ppisp
+    cfg.lr_decay_start  = args.lr_decay_start
+    cfg.lr_decay_iters  = args.lr_decay_iters
+    cfg.lr_decay_factor = args.lr_decay_factor
     cfg.progressive_texture = args.progressive_tex
     cfg.texture_dtype   = args.tex_dtype
     cfg.tex_optimizer   = args.tex_optimizer
@@ -215,6 +234,7 @@ def main():
     cfg.geometry_dtype  = args.geom_dtype
     cfg.geom_optimizer  = args.geom_optimizer
     cfg.geom_normal_tv_weight = args.geom_tv_weight
+    cfg.geom_face_uniform_weight = args.geom_face_uniform_weight
     cfg.max_vertex_offset     = (args.max_vertex_offset
                                  if args.max_vertex_offset > 0 else None)
     cfg.weld_geometry_vertices = not args.no_weld_geometry
