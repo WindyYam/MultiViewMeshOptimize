@@ -111,6 +111,18 @@ def parse_args():
                    help="GradScaler growth interval for fp16 AMP")
     p.add_argument("--no_tf32", action="store_true",
                    help="Disable TF32 matmul/conv acceleration on CUDA")
+    p.add_argument("--image_cpu_cache_size", type=int, default=8,
+                   help="Number of GT images kept in CPU RAM cache")
+    p.add_argument("--image_gpu_cache_size", type=int, default=3,
+                   help="Number of GT images prefetched to GPU cache")
+    p.add_argument("--image_prefetch_ahead", type=int, default=4,
+                   help="How many future training views to prefetch")
+    p.add_argument("--image_loader_workers", type=int, default=2,
+                   help="Background worker threads for image decode/load")
+    p.add_argument("--no_image_fs_cache", action="store_true",
+                   help="Disable filesystem cache of resized GT images")
+    p.add_argument("--image_cache_dir", type=str, default=None,
+                   help="Filesystem cache directory for GT images (default: <output>/image_cache)")
     return p.parse_args()
 
 
@@ -168,6 +180,12 @@ def main():
         cfg.amp_init_scale  = args.amp_init_scale
         cfg.amp_growth_interval = args.amp_growth_interval
         cfg.use_tf32        = not args.no_tf32
+        cfg.image_cpu_cache_size = args.image_cpu_cache_size
+        cfg.image_gpu_cache_size = args.image_gpu_cache_size
+        cfg.image_prefetch_ahead = args.image_prefetch_ahead
+        cfg.image_loader_workers = args.image_loader_workers
+        cfg.image_fs_cache       = not args.no_image_fs_cache
+        cfg.image_cache_dir      = args.image_cache_dir
         cfg.device          = str(device)
         cfg.log_every       = max(1, args.iters // 30)
         cfg.save_every      = max(1, args.iters // 5)
@@ -193,8 +211,6 @@ def main():
         uv_unwrap_size=args.tex_res,
         device=str(device),
     )
-    scene.load_gt_images()
-
     cfg = TrainConfig()
     cfg.num_iterations  = args.iters
     cfg.output_dir      = args.output
@@ -244,6 +260,12 @@ def main():
     cfg.amp_init_scale  = args.amp_init_scale
     cfg.amp_growth_interval = args.amp_growth_interval
     cfg.use_tf32        = not args.no_tf32
+    cfg.image_cpu_cache_size = args.image_cpu_cache_size
+    cfg.image_gpu_cache_size = args.image_gpu_cache_size
+    cfg.image_prefetch_ahead = args.image_prefetch_ahead
+    cfg.image_loader_workers = args.image_loader_workers
+    cfg.image_fs_cache       = not args.no_image_fs_cache
+    cfg.image_cache_dir      = args.image_cache_dir
     cfg.device          = str(device)
 
     trainer = TexturePPISPTrainer(scene, cfg)

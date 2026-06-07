@@ -9,7 +9,9 @@ Training loop:
   - Checkpoint every N iters, export at end
 """
 
-import os, math, time, random
+import os, math, time, random, hashlib
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, List, Callable
 from contextlib import nullcontext
@@ -24,7 +26,7 @@ import numpy as np
 from .ppisp    import PPISPParams
 from .renderer import TextureMap, Rasterizer
 from .losses   import TotalLoss
-from .dataset  import ColmapScene, CameraView
+from .dataset  import ColmapScene, CameraView, load_image
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +85,193 @@ class TrainConfig:
     amp_init_scale:        float = 1024.0
     amp_growth_interval:   int   = 2000
     use_tf32:              bool  = True
+    image_cpu_cache_size:  int   = 8
+    image_gpu_cache_size:  int   = 3
+    image_prefetch_ahead:  int   = 4
+    image_loader_workers:  int   = 2
+    image_fs_cache:        bool  = True
+    image_cache_dir:       Optional[str] = None
+
+
+class AsyncImageCache:
+    """
+    Bounded CPU/GPU cache for training images with optional filesystem cache.
+    CPU decode/load runs in a background thread pool.
+    CUDA transfers run on a dedicated prefetch stream.
+    """
+
+    def __init__(
+        self,
+        views: List[CameraView],
+        device: torch.device,
+        cpu_cache_size: int,
+        gpu_cache_size: int,
+        prefetch_ahead: int,
+        loader_workers: int,
+        use_fs_cache: bool,
+        fs_cache_dir: Optional[str],
+    ):
+        self.views = views
+        self.device = device
+        self.pin_memory = (device.type == "cuda")
+        self.cpu_cache_size = max(1, int(cpu_cache_size))
+        self.gpu_cache_size = max(1, int(gpu_cache_size))
+        self.prefetch_ahead = max(1, int(prefetch_ahead))
+        self.use_fs_cache = bool(use_fs_cache)
+
+        self.cpu_cache: OrderedDict[int, torch.Tensor] = OrderedDict()
+        self.cpu_futures = {}
+        self.gpu_cache: OrderedDict[int, tuple] = OrderedDict()
+
+        self.executor = ThreadPoolExecutor(max_workers=max(1, int(loader_workers)))
+        self.prefetch_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+
+        self.fs_cache_dir = None
+        if self.use_fs_cache:
+            cache_root = fs_cache_dir or ".image_cache"
+            self.fs_cache_dir = Path(cache_root)
+            self.fs_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _cache_path_for_view(self, view: CameraView) -> Optional[Path]:
+        if self.fs_cache_dir is None:
+            return None
+        try:
+            st = os.stat(view.image_path)
+            stamp = f"{os.path.abspath(view.image_path)}|{view.W}|{view.H}|{st.st_mtime_ns}|{st.st_size}"
+        except OSError:
+            stamp = f"{os.path.abspath(view.image_path)}|{view.W}|{view.H}"
+        key = hashlib.sha1(stamp.encode("utf-8")).hexdigest()
+        return self.fs_cache_dir / f"{key}.npy"
+
+    def _load_cpu_image(self, idx: int) -> torch.Tensor:
+        view = self.views[idx]
+        if view.gt_image is not None:
+            img = view.gt_image.detach().cpu().float().contiguous()
+            return img.pin_memory() if self.pin_memory and not img.is_pinned() else img
+
+        cache_path = self._cache_path_for_view(view)
+        if cache_path is not None and cache_path.exists():
+            try:
+                arr = np.load(str(cache_path), allow_pickle=False)
+                if arr.dtype == np.uint8 and arr.ndim == 3 and arr.shape[2] == 3:
+                    t = torch.from_numpy(arr.astype(np.float32) / 255.0).contiguous()
+                    return t.pin_memory() if self.pin_memory else t
+            except Exception:
+                pass
+
+        img = load_image(view.image_path, view.W, view.H).float().contiguous()
+        if cache_path is not None:
+            try:
+                arr_u8 = (img.numpy() * 255.0).clip(0.0, 255.0).astype(np.uint8)
+                np.save(str(cache_path), arr_u8, allow_pickle=False)
+            except Exception:
+                pass
+        return img.pin_memory() if self.pin_memory else img
+
+    def _touch_cpu(self, idx: int, tensor: torch.Tensor):
+        self.cpu_cache[idx] = tensor
+        self.cpu_cache.move_to_end(idx)
+        while len(self.cpu_cache) > self.cpu_cache_size:
+            self.cpu_cache.popitem(last=False)
+
+    def _get_cpu(self, idx: int) -> torch.Tensor:
+        t = self.cpu_cache.get(idx)
+        if t is not None:
+            self.cpu_cache.move_to_end(idx)
+            return t
+
+        fut = self.cpu_futures.get(idx)
+        if fut is None:
+            fut = self.executor.submit(self._load_cpu_image, idx)
+            self.cpu_futures[idx] = fut
+
+        t = fut.result()
+        self.cpu_futures.pop(idx, None)
+        self._touch_cpu(idx, t)
+        return t
+
+    def _start_gpu_transfer(self, idx: int, cpu_tensor: torch.Tensor):
+        if self.device.type != "cuda":
+            return
+        if idx in self.gpu_cache:
+            self.gpu_cache.move_to_end(idx)
+            return
+        assert self.prefetch_stream is not None
+        with torch.cuda.stream(self.prefetch_stream):
+            gpu_tensor = cpu_tensor.to(self.device, non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(self.prefetch_stream)
+        self.gpu_cache[idx] = (gpu_tensor, done)
+        self.gpu_cache.move_to_end(idx)
+        while len(self.gpu_cache) > self.gpu_cache_size:
+            _, (old_tensor, old_event) = self.gpu_cache.popitem(last=False)
+            try:
+                old_event.synchronize()
+            except Exception:
+                pass
+            del old_tensor
+
+    def _promote_ready(self, indices: List[int]):
+        if self.device.type != "cuda":
+            return
+        for idx in indices:
+            if idx in self.gpu_cache:
+                continue
+            t = self.cpu_cache.get(idx)
+            if t is None:
+                fut = self.cpu_futures.get(idx)
+                if fut is None or not fut.done():
+                    continue
+                try:
+                    t = fut.result()
+                    self.cpu_futures.pop(idx, None)
+                    self._touch_cpu(idx, t)
+                except Exception:
+                    self.cpu_futures.pop(idx, None)
+                    continue
+            self._start_gpu_transfer(idx, t)
+
+    def prefetch(self, indices: List[int]):
+        seen = set()
+        ordered = []
+        for idx in indices:
+            if idx in seen:
+                continue
+            seen.add(idx)
+            ordered.append(idx)
+
+        for idx in ordered:
+            if idx in self.cpu_cache or idx in self.cpu_futures:
+                continue
+            self.cpu_futures[idx] = self.executor.submit(self._load_cpu_image, idx)
+        self._promote_ready(ordered)
+
+    def get(self, idx: int) -> torch.Tensor:
+        if self.device.type != "cuda":
+            return self._get_cpu(idx)
+
+        self._promote_ready([idx])
+        entry = self.gpu_cache.get(idx)
+        if entry is None:
+            cpu = self._get_cpu(idx)
+            self._start_gpu_transfer(idx, cpu)
+            entry = self.gpu_cache[idx]
+        gpu_tensor, done = entry
+        torch.cuda.current_stream(self.device).wait_event(done)
+        self.gpu_cache.move_to_end(idx)
+        return gpu_tensor
+
+    def get_cpu_cached(self, idx: int) -> Optional[torch.Tensor]:
+        return self.cpu_cache.get(idx)
+
+    def get_cpu(self, idx: int) -> torch.Tensor:
+        return self._get_cpu(idx)
+
+    def close(self):
+        self.executor.shutdown(wait=True)
+        self.cpu_futures.clear()
+        self.cpu_cache.clear()
+        self.gpu_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -207,10 +396,20 @@ class TexturePPISPTrainer:
         self._cam_t = [v.t.to(self.device) for v in scene.views]
         self._cam_K = [v.K.to(self.device) for v in scene.views]
 
-        # ---- Pin GT images for fast async GPU transfer ----
-        for v in scene.views:
-            if v.gt_image is not None and self.device.type == "cuda":
-                v.gt_image = v.gt_image.pin_memory()
+        # ---- Async GT image cache / prefetch ----
+        img_cache_dir = config.image_cache_dir
+        if not img_cache_dir:
+            img_cache_dir = os.path.join(config.output_dir, "image_cache")
+        self._image_cache = AsyncImageCache(
+            views=scene.views,
+            device=self.device,
+            cpu_cache_size=config.image_cpu_cache_size,
+            gpu_cache_size=config.image_gpu_cache_size,
+            prefetch_ahead=config.image_prefetch_ahead,
+            loader_workers=config.image_loader_workers,
+            use_fs_cache=config.image_fs_cache,
+            fs_cache_dir=img_cache_dir,
+        )
 
         # ---- Loss ----
         self.loss_fn = TotalLoss(
@@ -288,7 +487,6 @@ class TexturePPISPTrainer:
         if config.progressive_texture:
             print(
                 "[Trainer] TexProg   : on"
-                f"  1/3 at half-res until iter<{self._tex_stage_iters}, 2/3 at full-res after"
             )
         else:
             print("[Trainer] TexProg   : off")
@@ -296,6 +494,11 @@ class TexturePPISPTrainer:
             "[Trainer] UpdateFreq : "
             f"tex every {max(1, int(config.tex_update_every))} it, "
             f"geom every {max(1, int(config.geom_update_every))} it"
+        )
+        print(
+            f"[Trainer] ImgCache   : cpu={int(config.image_cpu_cache_size)} "
+            f"gpu={int(config.image_gpu_cache_size)} prefetch={int(config.image_prefetch_ahead)} "
+            f"workers={int(config.image_loader_workers)} fs={'on' if config.image_fs_cache else 'off'}"
         )
         if self.learn_geometry:
             print(
@@ -429,6 +632,14 @@ class TexturePPISPTrainer:
         if iteration < self._tex_stage_iters:
             return 0
         return 1
+
+    def _build_training_schedule(self, num_views: int, num_iters: int) -> List[int]:
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(int(self.cfg.seed))
+        order = []
+        while len(order) < num_iters:
+            order.extend(torch.randperm(num_views, generator=gen).tolist())
+        return order[:num_iters]
 
     def _set_texture_stage(self, stage: int):
         target_h, target_w = self._stage_texture_resolution(stage)
@@ -615,6 +826,9 @@ class TexturePPISPTrainer:
         with torch.no_grad():
             pred = self.render_view(view).detach().clamp(0, 1).float().cpu().numpy()
         gt = view.gt_image
+        if gt is None and self._image_cache is not None:
+            # Keep side-by-side preview behavior unchanged: fetch GT on demand.
+            gt = self._image_cache.get_cpu(self._live_view_cam)
         if gt is not None:
             gt_np = gt.detach().cpu().numpy() if torch.is_tensor(gt) else np.asarray(gt)
             panel = np.concatenate([pred, gt_np], axis=1)
@@ -831,11 +1045,12 @@ class TexturePPISPTrainer:
     # Step
     # ------------------------------------------------------------------
 
-    def step(self, view: CameraView) -> dict:
-        gt = view.gt_image
+    def step(self, view: CameraView, gt_image: Optional[torch.Tensor] = None) -> dict:
+        gt = gt_image if gt_image is not None else view.gt_image
         if gt is None:
             raise ValueError(f"GT image not loaded for cam {view.cam_idx}")
-        gt = gt.to(self.device, non_blocking=True)
+        if gt.device != self.device:
+            gt = gt.to(self.device, non_blocking=True)
 
         tex_every = max(1, int(self.cfg.tex_update_every))
         train_tex = (
@@ -957,9 +1172,13 @@ class TexturePPISPTrainer:
 
     def train(self, progress_callback: Optional[Callable] = None):
         cfg   = self.cfg
-        views = [v for v in self.scene.views if v.gt_image is not None]
+        views = list(self.scene.views)
         if not views:
-            raise RuntimeError("No views with GT images. Call scene.load_gt_images() first.")
+            raise RuntimeError("No camera views found in scene.")
+
+        schedule = self._build_training_schedule(len(views), cfg.num_iterations)
+        warm_n = min(len(schedule), max(2, int(cfg.image_prefetch_ahead) + 1))
+        self._image_cache.prefetch([schedule[i] for i in range(warm_n)])
 
         t0 = time.time()
         print(f"\n[Trainer] ▶  Starting {cfg.num_iterations} iterations  "
@@ -969,55 +1188,65 @@ class TexturePPISPTrainer:
             "total", "photo", "ppisp_reg", "geom_normal_tv"
         )}
         t_iter  = time.time()
+        try:
+            for self.iter in range(cfg.num_iterations):
+                self._maybe_update_texture_stage()
+                vidx = schedule[self.iter]
+                view = views[vidx]
 
-        for self.iter in range(cfg.num_iterations):
-            self._maybe_update_texture_stage()
-            view   = random.choice(views)
-            losses = self.step(view)
-            self._update_lr()
-            self._poll_live_view_events()
-            self._update_live_view(losses)
+                next_i0 = self.iter + 1
+                next_i1 = min(cfg.num_iterations, next_i0 + int(cfg.image_prefetch_ahead))
+                if next_i0 < next_i1:
+                    self._image_cache.prefetch([schedule[j] for j in range(next_i0, next_i1)])
 
-            for k in running:
-                running[k] += losses.get(k, 0.0)
-            self.loss_log.append({"iter": self.iter, **losses})
+                gt = self._image_cache.get(vidx)
+                losses = self.step(view, gt_image=gt)
+                self._update_lr()
+                self._poll_live_view_events()
+                self._update_live_view(losses)
 
-            if (self.iter + 1) % cfg.log_every == 0:
-                it_per_s = cfg.log_every / max(time.time() - t_iter, 1e-6)
-                eta_s    = (cfg.num_iterations - self.iter - 1) / max(it_per_s, 1e-6)
-                if self.iter < cfg.warmup_iters:
-                    mode = "warmup"
-                elif self.learn_geometry and self.iter < cfg.geometry_warmup_iters:
-                    mode = "joint-no-geom"
-                else:
-                    mode = "joint"
-                avg      = {k: v / cfg.log_every for k, v in running.items()}
-                w_photo = cfg.photo_weight * avg["photo"]
-                w_ppisp_reg = cfg.ppisp_reg_weight * avg["ppisp_reg"]
-                w_normal_tv = (float(cfg.geom_normal_tv_weight) * avg["geom_normal_tv"]
-                               if self.learn_geometry and self.iter >= cfg.geometry_warmup_iters
-                               else 0.0)
-                w_total = w_photo + w_ppisp_reg + w_normal_tv
-                geom_txt = (f"w_nTV={w_normal_tv:.3e}"
-                            if self.learn_geometry else "")
-                print(
-                    f"  {self.iter+1:5d}/{cfg.num_iterations}  [{mode}]  "
-                    f"w_loss={w_total:.4f}  w_photo={w_photo:.4f}  "
-                    f"w_ppisp_reg={w_ppisp_reg:.5f}  "
-                    f"{geom_txt} "
-                    f"{it_per_s:.1f} it/s  ETA {eta_s/60:.1f}m"
-                )
-                running = {k: 0.0 for k in running}
-                t_iter  = time.time()
-                if progress_callback:
-                    progress_callback(self.iter + 1, cfg.num_iterations, losses)
+                for k in running:
+                    running[k] += losses.get(k, 0.0)
+                self.loss_log.append({"iter": self.iter, **losses})
 
-            if (self.iter + 1) % cfg.save_every == 0:
-                self._save_checkpoint(self.iter + 1)
+                if (self.iter + 1) % cfg.log_every == 0:
+                    it_per_s = cfg.log_every / max(time.time() - t_iter, 1e-6)
+                    eta_s    = (cfg.num_iterations - self.iter - 1) / max(it_per_s, 1e-6)
+                    if self.iter < cfg.warmup_iters:
+                        mode = "warmup"
+                    elif self.learn_geometry and self.iter < cfg.geometry_warmup_iters:
+                        mode = "joint-no-geom"
+                    else:
+                        mode = "joint"
+                    avg      = {k: v / cfg.log_every for k, v in running.items()}
+                    w_photo = cfg.photo_weight * avg["photo"]
+                    w_ppisp_reg = cfg.ppisp_reg_weight * avg["ppisp_reg"]
+                    w_normal_tv = (float(cfg.geom_normal_tv_weight) * avg["geom_normal_tv"]
+                                   if self.learn_geometry and self.iter >= cfg.geometry_warmup_iters
+                                   else 0.0)
+                    w_total = w_photo + w_ppisp_reg + w_normal_tv
+                    geom_txt = (f"w_nTV={w_normal_tv:.3e}"
+                                if self.learn_geometry else "")
+                    print(
+                        f"  {self.iter+1:5d}/{cfg.num_iterations}  [{mode}]  "
+                        f"w_loss={w_total:.4f}  w_photo={w_photo:.4f}  "
+                        f"w_ppisp_reg={w_ppisp_reg:.5f}  "
+                        f"{geom_txt} "
+                        f"{it_per_s:.1f} it/s  ETA {eta_s/60:.1f}m"
+                    )
+                    running = {k: 0.0 for k in running}
+                    t_iter  = time.time()
+                    if progress_callback:
+                        progress_callback(self.iter + 1, cfg.num_iterations, losses)
 
-        print(f"\n[Trainer] ✓  Done in {(time.time()-t0)/60:.1f} min")
-        self._close_live_view()
-        self.ppisp.print_summary()
+                if (self.iter + 1) % cfg.save_every == 0:
+                    self._save_checkpoint(self.iter + 1)
+
+            print(f"\n[Trainer] ✓  Done in {(time.time()-t0)/60:.1f} min")
+            self.ppisp.print_summary()
+        finally:
+            self._image_cache.close()
+            self._close_live_view()
 
     # ------------------------------------------------------------------
     # Checkpoint / export
@@ -1235,7 +1464,6 @@ def train_scene(scene_root: str, output_dir: str = "outputs",
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     scene  = ColmapScene(scene_root=scene_root, image_scale=image_scale,
                          device=device)
-    scene.load_gt_images()
     cfg = TrainConfig()
     cfg.num_iterations = num_iterations
     cfg.output_dir     = output_dir
