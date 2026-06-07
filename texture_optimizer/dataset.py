@@ -654,7 +654,6 @@ def _bake_vertex_colors_to_texture(
     mask = weight > 0
     # Fill zero-weight texels with nearest non-zero (simple dilation)
     from PIL import Image as PILImage
-    import numpy as np
     t_np = (tex.numpy() * 255).astype(np.uint8)
     # Two passes of median-ish fill via PIL resize trick
     small = PILImage.fromarray(t_np).resize((res//4, res//4), PILImage.BILINEAR)
