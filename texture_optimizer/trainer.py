@@ -42,7 +42,7 @@ class TrainConfig:
     lr_texture:       float = 1e-3
     lr_ppisp:         float = 5e-3
     lr_decay_start:   Optional[int] = None
-    lr_decay_factor:  float = 0.2
+    lr_decay_factor:  float = 0.1
     lr_decay_iters:   Optional[int] = None
 
     photo_weight:     float = 1.0
@@ -388,9 +388,6 @@ class TexturePPISPTrainer:
 
         # ---- Rasterizer ----
         self.rasterizer = Rasterizer(self.device)
-        if not self.rasterizer.uses_nvdiffrast:
-            print("[Trainer] WARNING: nvdiffrast not available — using slow software rasterizer")
-            print("          Install with:  pip install nvdiffrast")
 
         # ---- Pre-cache camera matrices on GPU ----
         self._cam_R = [v.R.to(self.device) for v in scene.views]
@@ -444,7 +441,7 @@ class TexturePPISPTrainer:
         n_ppisp = sum(p.numel() for p in self.ppisp.parameters())
         n_geom = int(self.geometry_offsets.numel()) if self.learn_geometry else 0
         print(f"\n[Trainer] Device    : {self.device}")
-        print(f"[Trainer] Backend   : {'nvdiffrast' if self.rasterizer.uses_nvdiffrast else 'software (SLOW)'}")
+        print("[Trainer] Backend   : nvdiffrast")
         print(f"[Trainer] Cameras   : {len(scene)}")
         print(f"[Trainer] Mesh      : {self.base_vertices.shape[0]:,} verts, {self.faces.shape[0]:,} faces")
         print(f"[Trainer] Texture   : {init_tex_h}×{init_tex_w} -> {self._full_tex_H}×{self._full_tex_W}  ({n_tex/1e6:.1f}M params)")
@@ -852,9 +849,19 @@ class TexturePPISPTrainer:
             bgr, label, (12, 28), self._cv2.FONT_HERSHEY_SIMPLEX,
             0.75, (50, 220, 50), 2, self._cv2.LINE_AA
         )
+        p = self.ppisp.get_params_dict(self._live_view_cam)
+        ppisp_line1 = (
+            f"exp={p['exposure']:.3f} gamma={p['gamma']:.2f} "
+            f"B={p['brightness']:+.3f} C={p['contrast']:.3f}"
+        )
+        ppisp_line2 = f"wb=({p['wb_r']:.3f},{p['wb_g']:.3f},{p['wb_b']:.3f})"
         self._cv2.putText(
-            bgr, "left: pred, right: gt", (12, 56), self._cv2.FONT_HERSHEY_SIMPLEX,
-            0.6, (220, 220, 220), 1, self._cv2.LINE_AA
+            bgr, ppisp_line1, (12, 56), self._cv2.FONT_HERSHEY_SIMPLEX,
+            0.6, (240, 220, 60), 2, self._cv2.LINE_AA
+        )
+        self._cv2.putText(
+            bgr, ppisp_line2, (12, 82), self._cv2.FONT_HERSHEY_SIMPLEX,
+            0.6, (240, 220, 60), 2, self._cv2.LINE_AA
         )
 
         self._cv2.imshow(self._live_view_window, bgr)

@@ -22,7 +22,7 @@ class PPISPParams(nn.Module):
       - gamma         : scalar, display gamma                  (0.8..2.4)
       - wb_gains      : (3,) R/G/B white balance multipliers
       - brightness    : scalar additive shift post-gamma
-      - contrast      : scalar multiplicative contrast         (0.5..2)
+    - contrast      : scalar multiplicative contrast         (>0, identity at 1)
       - vignette_k    : (optional) vignette falloff strength
 
     Forward call takes a rendered HDR patch (H, W, 3) in [0,∞) and
@@ -97,7 +97,8 @@ class PPISPParams(nn.Module):
 
     def contrast(self) -> torch.Tensor:
         """Return positive contrast  (N,)"""
-        return F.softplus(self.log_contrast) + 0.5   # (0.5, ∞)
+        # Identity at log_contrast=0 -> contrast=1.0
+        return torch.exp(self.log_contrast)          # (0, ∞)
 
     # ------------------------------------------------------------------
     # forward
@@ -115,7 +116,7 @@ class PPISPParams(nn.Module):
             cam_idx:   index into per-camera parameter arrays
 
         Returns:
-            (H, W, 3) float32 tensor in [0, 1]
+            (H, W, 3) float32 tensor (unbounded, supports HDR values)
         """
         x = rendered.float()                              # (H, W, 3)
 
@@ -133,18 +134,16 @@ class PPISPParams(nn.Module):
             vign = torch.exp(-k * self.r2)               # (H, W)
             x = x * vign.unsqueeze(-1)
 
-        # 4) Gamma compression  (safe power via clamp+eps)
+        # 4) Gamma compression with sign-preserving safe power.
+        # Avoids hard clamping so HDR gradients continue to flow.
         g = F.softplus(self.gamma_raw[cam_idx]) + 0.5
-        x = torch.clamp(x, min=1e-8)
-        x = x ** (1.0 / g)
+        x = torch.sign(x) * torch.pow(torch.abs(x) + 1e-8, 1.0 / g)
 
         # 5) Brightness + Contrast (applied in [0,1] space)
-        c = F.softplus(self.log_contrast[cam_idx]) + 0.5
+        c = torch.exp(self.log_contrast[cam_idx])
         b = self.brightness[cam_idx]
         x = c * (x - 0.5) + 0.5 + b
 
-        # 6) Final clamp to [0, 1]
-        x = torch.clamp(x, 0.0, 1.0)
         return x
 
     # ------------------------------------------------------------------

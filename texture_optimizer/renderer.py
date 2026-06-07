@@ -3,7 +3,6 @@ Differentiable mesh rasterizer.
 
 Backend priority:
   1. nvdiffrast  (GPU, ~1ms per frame for 1M faces) — pip install nvdiffrast
-  2. SoftwareRasterizer  (pure PyTorch, only for tiny test meshes)
 
 Pipeline:
   world verts → clip space (R, t, K)
@@ -157,7 +156,7 @@ class NvdiffrastRasterizer:
                                        diff_attrs="all")          # (1,H,W,2)
 
         # 4) Sample texture. Keep atlas dtype when possible to reduce VRAM.
-        tex_hwc = torch.clamp(texture.tex, 0, 1).permute(0, 2, 3, 1).contiguous()
+        tex_hwc = texture.tex.permute(0, 2, 3, 1).contiguous()
         texc_c  = texc.to(dtype=tex_hwc.dtype).contiguous()
         texc_db_c = texc_db.to(dtype=tex_hwc.dtype).contiguous()
         try:
@@ -187,89 +186,23 @@ class NvdiffrastRasterizer:
 
 
 # ---------------------------------------------------------------------------
-# Software rasterizer (fallback — tiny meshes / unit tests only)
-# ---------------------------------------------------------------------------
-
-class SoftwareRasterizer:
-    def __init__(self, device: torch.device):
-        self.device = device
-
-    def render(self, vertices, faces, uvs, texture, R, t, K, W, H,
-               return_mask: bool = False):
-        pts_cam  = (R @ vertices.T).T + t
-        depth    = pts_cam[:, 2]
-        pts_img  = (K @ pts_cam.T).T
-        verts_2d = pts_img[:, :2] / pts_img[:, 2:3].clamp(min=1e-6)
-
-        ys = torch.arange(H, dtype=torch.float32, device=self.device)
-        xs = torch.arange(W, dtype=torch.float32, device=self.device)
-        gy, gx = torch.meshgrid(ys, xs, indexing="ij")
-        pixels = torch.stack([gx, gy], dim=-1)
-        image  = torch.zeros(H, W, 3, device=self.device)
-        z_buf  = torch.full((H, W), float("inf"), device=self.device)
-
-        def edge(a, b, p):
-            return (p[...,0]-a[0])*(b[1]-a[1]) - (p[...,1]-a[1])*(b[0]-a[0])
-
-        for fi in range(faces.shape[0]):
-            i0, i1, i2 = faces[fi]
-            p0, p1, p2 = verts_2d[i0], verts_2d[i1], verts_2d[i2]
-            d0, d1, d2 = depth[i0], depth[i1], depth[i2]
-            if d0 <= 0 and d1 <= 0 and d2 <= 0:
-                continue
-            x0 = max(0,   int(min(p0[0], p1[0], p2[0]).item()) - 1)
-            x1 = min(W-1, int(max(p0[0], p1[0], p2[0]).item()) + 1)
-            y0 = max(0,   int(min(p0[1], p1[1], p2[1]).item()) - 1)
-            y1 = min(H-1, int(max(p0[1], p1[1], p2[1]).item()) + 1)
-            if x0 > x1 or y0 > y1:
-                continue
-            tile = pixels[y0:y1+1, x0:x1+1]
-            area = edge(p0, p1, p2)
-            if area.abs().item() < 1e-8:
-                continue
-            e0 = edge(p1, p2, tile)
-            e1 = edge(p2, p0, tile)
-            e2 = edge(p0, p1, tile)
-            mask = ((e0>=0)&(e1>=0)&(e2>=0)) if area > 0 else ((e0<=0)&(e1<=0)&(e2<=0))
-            if not mask.any():
-                continue
-            w0, w1, w2 = e0/area, e1/area, e2/area
-            z    = w0*d0 + w1*d1 + w2*d2
-            uv_t = (w0.unsqueeze(-1)*uvs[i0] + w1.unsqueeze(-1)*uvs[i1]
-                    + w2.unsqueeze(-1)*uvs[i2])
-            iy, ix = torch.where(mask)
-            for k in range(len(iy)):
-                py, px = y0+iy[k].item(), x0+ix[k].item()
-                if z[iy[k], ix[k]] < z_buf[py, px]:
-                    z_buf[py, px] = z[iy[k], ix[k]].detach()
-                    image[py, px] = texture.sample(uv_t[iy[k], ix[k]].unsqueeze(0))[0]
-        if not return_mask:
-            return image
-
-        mask = torch.isfinite(z_buf).to(image.dtype).unsqueeze(-1)
-        return image, mask
-
-
-# ---------------------------------------------------------------------------
-# Unified rasterizer — auto-selects backend
+# Unified rasterizer — nvdiffrast only
 # ---------------------------------------------------------------------------
 
 class Rasterizer:
     def __init__(self, device: torch.device):
         self._nvdr = NvdiffrastRasterizer(device)
-        self._sw   = SoftwareRasterizer(device) if not self._nvdr.available else None
-        self.uses_nvdiffrast = self._nvdr.available
+        if not self._nvdr.available:
+            raise RuntimeError(
+                "nvdiffrast is required but unavailable. Install with: pip install nvdiffrast"
+            )
+        self.uses_nvdiffrast = True
 
     def render(self, vertices, faces, uvs, texture, R, t, K, W, H) -> torch.Tensor:
-        if self._nvdr.available:
-            return self._nvdr.render(vertices, faces,
-                                     uvs, texture, R, t, K, W, H)
-        return self._sw.render(vertices, faces, uvs, texture, R, t, K, W, H)
+        return self._nvdr.render(vertices, faces,
+                                 uvs, texture, R, t, K, W, H)
 
     def render_with_mask(self, vertices, faces, uvs, texture, R, t, K, W, H):
-        if self._nvdr.available:
-            return self._nvdr.render(vertices, faces,
-                                     uvs, texture, R, t, K, W, H,
-                                     return_mask=True)
-        return self._sw.render(vertices, faces, uvs, texture, R, t, K, W, H,
-                               return_mask=True)
+        return self._nvdr.render(vertices, faces,
+                                 uvs, texture, R, t, K, W, H,
+                                 return_mask=True)

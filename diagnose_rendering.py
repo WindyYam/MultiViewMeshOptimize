@@ -265,8 +265,6 @@ def main():
 
     # Rasterizer — needs nvdiffrast for stages 2+
     rasterizer = Rasterizer(device)
-    if not rasterizer.uses_nvdiffrast:
-        print("WARNING: nvdiffrast not available — stages 2-5 will be skipped")
 
     # Choose cameras
     n = len(scene)
@@ -290,54 +288,53 @@ def main():
         summary_panels.append(pil1)
         print(f"  S1 pose:     {info1}")
 
-        if rasterizer.uses_nvdiffrast:
-            import nvdiffrast.torch as dr
+        import nvdiffrast.torch as dr
 
-            # ---- Stage 2: Rasterization ----
-            cov, dep, uv_vis, rast, rast_db, info2 = stage2_raster(
-                view, vertices, faces, uvs, rasterizer, device)
-            save(cov,    os.path.join(cdir, "s2_coverage.png"))
-            save(dep,    os.path.join(cdir, "s2_depth.png"))
-            save(uv_vis, os.path.join(cdir, "s2_uvmap.png"))
-            rast_tuple = (rast, rast_db)
+        # ---- Stage 2: Rasterization ----
+        cov, dep, uv_vis, rast, rast_db, info2 = stage2_raster(
+            view, vertices, faces, uvs, rasterizer, device)
+        save(cov,    os.path.join(cdir, "s2_coverage.png"))
+        save(dep,    os.path.join(cdir, "s2_depth.png"))
+        save(uv_vis, os.path.join(cdir, "s2_uvmap.png"))
+        rast_tuple = (rast, rast_db)
+        summary_panels += [
+            label(Image.fromarray((cov.cpu().numpy()*255).astype("uint8")),   "S2: coverage"),
+            label(Image.fromarray((dep.cpu().numpy()*255).astype("uint8")),   "S2: depth"),
+            label(Image.fromarray((uv_vis.cpu().numpy()*255).astype("uint8")),"S2: UV"),
+        ]
+        print(f"  S2 raster:   {info2}")
+
+        # ---- Stage 3: Texture ----
+        tex_render, info3 = stage3_texture(
+            view, vertices, faces, uvs, texture, rast_tuple, device)
+        save(tex_render, os.path.join(cdir, "s3_texture.png"))
+        summary_panels.append(
+            label(Image.fromarray((tex_render.cpu().numpy()*255).astype("uint8")),
+                  "S3: texture"))
+        print(f"  S3 texture:  {info3}")
+
+        # ---- Stage 4: PPISP ----
+        ldr, info4 = stage4_ppisp(view, tex_render, ppisp, device)
+        save(ldr, os.path.join(cdir, "s4_ppisp.png"))
+        summary_panels.append(
+            label(Image.fromarray((ldr.cpu().numpy()*255).astype("uint8")),
+                  "S4: PPISP"))
+        print(f"  S4 PPISP:    {info4}")
+
+        # ---- Stage 5: Diff vs GT ----
+        gt = view.gt_image.to(device) if view.gt_image is not None else None
+        diff, info5 = stage5_diff(ldr, gt)
+        if diff is not None:
+            save(diff, os.path.join(cdir, "s5_diff.png"))
+            if gt is not None:
+                save(gt,  os.path.join(cdir, "s5_gt.png"))
             summary_panels += [
-                label(Image.fromarray((cov.cpu().numpy()*255).astype("uint8")),   "S2: coverage"),
-                label(Image.fromarray((dep.cpu().numpy()*255).astype("uint8")),   "S2: depth"),
-                label(Image.fromarray((uv_vis.cpu().numpy()*255).astype("uint8")),"S2: UV"),
+                label(Image.fromarray((gt.cpu().numpy()*255).astype("uint8")),
+                      "GT") if gt is not None else Image.new("RGB",(view.W,view.H)),
+                label(Image.fromarray((diff.cpu().numpy()*255).astype("uint8")),
+                      "S5: diff×5"),
             ]
-            print(f"  S2 raster:   {info2}")
-
-            # ---- Stage 3: Texture ----
-            tex_render, info3 = stage3_texture(
-                view, vertices, faces, uvs, texture, rast_tuple, device)
-            save(tex_render, os.path.join(cdir, "s3_texture.png"))
-            summary_panels.append(
-                label(Image.fromarray((tex_render.cpu().numpy()*255).astype("uint8")),
-                      "S3: texture"))
-            print(f"  S3 texture:  {info3}")
-
-            # ---- Stage 4: PPISP ----
-            ldr, info4 = stage4_ppisp(view, tex_render, ppisp, device)
-            save(ldr, os.path.join(cdir, "s4_ppisp.png"))
-            summary_panels.append(
-                label(Image.fromarray((ldr.cpu().numpy()*255).astype("uint8")),
-                      "S4: PPISP"))
-            print(f"  S4 PPISP:    {info4}")
-
-            # ---- Stage 5: Diff vs GT ----
-            gt = view.gt_image.to(device) if view.gt_image is not None else None
-            diff, info5 = stage5_diff(ldr, gt)
-            if diff is not None:
-                save(diff, os.path.join(cdir, "s5_diff.png"))
-                if gt is not None:
-                    save(gt,  os.path.join(cdir, "s5_gt.png"))
-                summary_panels += [
-                    label(Image.fromarray((gt.cpu().numpy()*255).astype("uint8")),
-                          "GT") if gt is not None else Image.new("RGB",(view.W,view.H)),
-                    label(Image.fromarray((diff.cpu().numpy()*255).astype("uint8")),
-                          "S5: diff×5"),
-                ]
-            print(f"  S5 diff:     {info5}")
+        print(f"  S5 diff:     {info5}")
 
         # ---- Summary strip ----
         if summary_panels:
