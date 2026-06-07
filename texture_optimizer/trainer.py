@@ -91,6 +91,7 @@ class TrainConfig:
     image_loader_workers:  int   = 2
     image_fs_cache:        bool  = True
     image_cache_dir:       Optional[str] = None
+    tex_linear:            bool  = False
 
 
 class AsyncImageCache:
@@ -1419,9 +1420,19 @@ class TexturePPISPTrainer:
 
         # Optimised texture
         tex_np = self.texture.as_image().cpu().numpy()
+        if not getattr(self.cfg, "tex_linear", False):
+            tex_np = np.clip(tex_np, 0.0, 1.0)
+            tex_np = np.where(
+                tex_np <= 0.0031308,
+                12.92 * tex_np,
+                1.055 * np.power(tex_np, 1.0 / 2.4) - 0.055,
+            )
         Image.fromarray((tex_np * 255).astype(np.uint8)).save(
             os.path.join(out, "optimized_texture.png"))
-        print(f"[Export] Texture  → {out}/optimized_texture.png")
+        if not getattr(self.cfg, "tex_linear", False):
+            print(f"[Export] Texture  → {out}/optimized_texture.png (sRGB-encoded)")
+        else:
+            print(f"[Export] Texture  → {out}/optimized_texture.png")
 
         # PPISP params
         import json

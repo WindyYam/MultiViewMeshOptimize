@@ -14,6 +14,7 @@ Usage:
 import argparse
 import sys
 import os
+import shutil
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -42,9 +43,9 @@ def parse_args():
                    help="Texture optimizer (sgd reduces VRAM vs adam)")
     p.add_argument("--progressive_tex", action="store_true",
                    help="Use progressive texture upscaling during training (1/2 -> full)")
-    p.add_argument("--lr_tex",      type=float, default=2e-3,
+    p.add_argument("--lr_tex",      type=float, default=1e-3,
                    help="Texture learning rate")
-    p.add_argument("--lr_ppisp",    type=float, default=5e-3,
+    p.add_argument("--lr_ppisp",    type=float, default=3e-3,
                    help="PPISP learning rate")
     p.add_argument("--lr_decay_start", type=int, default=None,
                    help="Iteration to start LR decay (default: auto at ~75%% of total iters)")
@@ -123,11 +124,21 @@ def parse_args():
                    help="Disable filesystem cache of resized GT images")
     p.add_argument("--image_cache_dir", type=str, default=None,
                    help="Filesystem cache directory for GT images (default: <output>/image_cache)")
+    p.add_argument("--tex_linear", action="store_true",
+                   help="Treat input texture as linear and export PNG without sRGB encoding")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
+    cache_dir = args.image_cache_dir or os.path.join(args.output, "image_cache")
+    if os.path.isdir(cache_dir):
+        print(f"[Startup] Removing existing image cache: {cache_dir}")
+        shutil.rmtree(cache_dir)
+    elif os.path.exists(cache_dir):
+        print(f"[Startup] Removing existing cache file: {cache_dir}")
+        os.remove(cache_dir)
 
     import torch
     device = torch.device(args.device or
@@ -186,6 +197,7 @@ def main():
         cfg.image_loader_workers = args.image_loader_workers
         cfg.image_fs_cache       = not args.no_image_fs_cache
         cfg.image_cache_dir      = args.image_cache_dir
+        cfg.tex_linear     = args.tex_linear
         cfg.device          = str(device)
         cfg.log_every       = max(1, args.iters // 30)
         cfg.save_every      = max(1, args.iters // 5)
@@ -207,6 +219,7 @@ def main():
         image_scale=args.scale,
         max_cameras=args.max_cameras,
         mesh_path=args.mesh,
+        tex_linear=args.tex_linear,
         uv_unwrap_mode=("open3d_xatlas" if args.uv_unwrap else "none"),
         uv_unwrap_size=args.tex_res,
         device=str(device),
@@ -266,6 +279,7 @@ def main():
     cfg.image_loader_workers = args.image_loader_workers
     cfg.image_fs_cache       = not args.no_image_fs_cache
     cfg.image_cache_dir      = args.image_cache_dir
+    cfg.tex_linear     = args.tex_linear
     cfg.device          = str(device)
 
     trainer = TexturePPISPTrainer(scene, cfg)
