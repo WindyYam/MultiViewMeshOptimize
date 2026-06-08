@@ -74,9 +74,9 @@ def parse_args():
                    help="Geometry offset dtype (auto follows AMP on CUDA; lowers VRAM when fp16/bf16)")
     p.add_argument("--geom_optimizer", type=str, default="adam", choices=["adam", "sgd"],
                    help="Geometry optimizer (sgd reduces VRAM vs adam)")
-    p.add_argument("--geom_tv_weight", type=float, default=10,
+    p.add_argument("--geom_tv_weight", type=float, default=5,
                    help="Weight for geometry normal-TV regularization")
-    p.add_argument("--geom_edge_uniform_weight", type=float, default=1e-1,
+    p.add_argument("--geom_edge_uniform_weight", type=float, default=5e-2,
                    help="Weight for per-face edge-length uniformity regularization")
     p.add_argument("--geom_edge_uniform_eps", type=float, default=1e-8,
                    help="Numerical epsilon for edge uniformity regularization")
@@ -120,11 +120,11 @@ def parse_args():
                    help="GradScaler growth interval for fp16 AMP")
     p.add_argument("--no_tf32", action="store_true",
                    help="Disable TF32 matmul/conv acceleration on CUDA")
-    p.add_argument("--image_cpu_cache_size", type=int, default=8,
+    p.add_argument("--image_cpu_cache_size", type=int, default=32,
                    help="Number of GT images kept in CPU RAM cache")
-    p.add_argument("--image_gpu_cache_size", type=int, default=3,
+    p.add_argument("--image_gpu_cache_size", type=int, default=4,
                    help="Number of GT images prefetched to GPU cache")
-    p.add_argument("--image_prefetch_ahead", type=int, default=4,
+    p.add_argument("--image_prefetch_ahead", type=int, default=2,
                    help="How many future training views to prefetch")
     p.add_argument("--image_loader_workers", type=int, default=2,
                    help="Background worker threads for image decode/load")
