@@ -123,6 +123,99 @@ def _ssim_loss_msssim(
     return 1.0 - ssim_val
 
 
+def compute_face_normals_and_double_area(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    v0 = vertices[faces[:, 0]]
+    v1 = vertices[faces[:, 1]]
+    v2 = vertices[faces[:, 2]]
+    n_raw = torch.cross(v1 - v0, v2 - v0, dim=1)
+    a2 = n_raw.norm(dim=1).clamp(min=1e-12)
+    n_unit = n_raw / a2.unsqueeze(1)
+    return n_unit, a2
+
+
+def _geometry_normal_tv_loss(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    face_adj_pairs: Optional[torch.Tensor],
+    face_adj_edges: Optional[torch.Tensor] = None,
+    base_face_pair_weight: Optional[torch.Tensor] = None,
+    weld_index: Optional[torch.Tensor] = None,
+    num_weld_groups: Optional[int] = None,
+    weld_group_inv_counts: Optional[torch.Tensor] = None,
+    delta: float = 1e-3,
+) -> torch.Tensor:
+    """
+    TV-like prior on face normals over adjacent faces.
+    Encourages piecewise-planar surfaces while preserving sharp edges.
+    """
+    if face_adj_pairs is None or face_adj_pairs.shape[0] == 0:
+        return torch.zeros((), device=vertices.device, dtype=vertices.dtype)
+
+    n_unit, _ = compute_face_normals_and_double_area(vertices, faces)
+    p = face_adj_pairs
+    cos_ij = (n_unit[p[:, 0]] * n_unit[p[:, 1]]).sum(dim=1).clamp(-1.0, 1.0)
+    d = 1.0 - cos_ij
+
+    delta_val = float(max(1e-8, delta))
+    tv = torch.sqrt(d * d + delta_val * delta_val) - delta_val
+
+    weights = base_face_pair_weight
+
+    if face_adj_edges is not None:
+        e = face_adj_edges
+        if weld_index is None:
+            edge_len = (vertices[e[:, 0]] - vertices[e[:, 1]]).norm(dim=1).clamp(min=1e-8)
+        else:
+            n_groups = int(num_weld_groups) if num_weld_groups is not None else int(weld_index.max().item() + 1)
+            group_pos = torch.zeros((n_groups, 3), device=vertices.device, dtype=vertices.dtype)
+            group_pos.index_add_(0, weld_index, vertices)
+            inv_counts = weld_group_inv_counts
+            if inv_counts is None:
+                inv_counts = torch.ones(n_groups, device=vertices.device, dtype=vertices.dtype)
+            else:
+                inv_counts = inv_counts.to(device=vertices.device, dtype=vertices.dtype)
+            group_pos = group_pos * inv_counts.unsqueeze(1)
+            edge_len = (group_pos[e[:, 0]] - group_pos[e[:, 1]]).norm(dim=1).clamp(min=1e-8)
+        if weights is None:
+            weights = edge_len
+        else:
+            weights = weights.to(device=vertices.device, dtype=tv.dtype) * edge_len
+
+    if weights is None:
+        return tv.mean()
+    return (weights * tv).sum() / weights.sum().clamp(min=1e-8)
+
+
+def _geometry_face_edge_uniform_loss(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Encourage each triangle to have similar edge lengths.
+    Scale-invariant form: penalize per-face edge-length variance normalized by
+    the triangle's mean edge length.
+    """
+    if faces is None or faces.numel() == 0:
+        return torch.zeros((), device=vertices.device, dtype=vertices.dtype)
+
+    v0 = vertices[faces[:, 0]]
+    v1 = vertices[faces[:, 1]]
+    v2 = vertices[faces[:, 2]]
+
+    l01 = (v0 - v1).norm(dim=1)
+    l12 = (v1 - v2).norm(dim=1)
+    l20 = (v2 - v0).norm(dim=1)
+    edges = torch.stack([l01, l12, l20], dim=1)
+
+    mean_len = edges.mean(dim=1, keepdim=True).clamp(min=float(max(1e-12, eps)))
+    rel = edges / mean_len
+    return (rel - 1.0).pow(2).mean()
+
+
 # ---------------------------------------------------------------------------
 # Photometric loss
 # ---------------------------------------------------------------------------
@@ -248,6 +341,10 @@ class TotalLoss(nn.Module):
         self,
         photo_weight:      float = 1.0,
         ppisp_reg_weight:  float = 1e-2,
+        geom_normal_tv_weight: float = 0.0,
+        geom_normal_tv_delta: float = 1e-3,
+        geom_edge_uniform_weight: float = 0.0,
+        geom_edge_uniform_eps: float = 1e-8,
         l1_weight:         float = 0.8,
         ssim_weight:       float = 0.2,
         ssim_backend:      str = "auto",
@@ -255,6 +352,10 @@ class TotalLoss(nn.Module):
         super().__init__()
         self.w_photo    = photo_weight
         self.w_ppisp    = ppisp_reg_weight
+        self.w_geom_tv  = geom_normal_tv_weight
+        self.geom_tv_delta = geom_normal_tv_delta
+        self.w_geom_edge_uniform = geom_edge_uniform_weight
+        self.geom_edge_uniform_eps = geom_edge_uniform_eps
 
         self.photo_loss   = PhotometricLoss(
             l1_weight=l1_weight,
@@ -269,15 +370,50 @@ class TotalLoss(nn.Module):
         target:  torch.Tensor,
         ppisp:   "PPISPParams",
         mask:    Optional[torch.Tensor] = None,
+        learn_geometry: bool = False,
+        train_geometry: bool = False,
+        vertices: Optional[torch.Tensor] = None,
+        faces: Optional[torch.Tensor] = None,
+        face_adj_pairs: Optional[torch.Tensor] = None,
+        face_adj_edges: Optional[torch.Tensor] = None,
+        base_face_pair_weight: Optional[torch.Tensor] = None,
+        weld_index: Optional[torch.Tensor] = None,
+        num_weld_groups: Optional[int] = None,
+        weld_group_inv_counts: Optional[torch.Tensor] = None,
     ) -> dict:
         photo = self.photo_loss(pred, target, mask)
         p_reg = self.ppisp_reg(ppisp)
 
+        if learn_geometry and train_geometry and vertices is not None and faces is not None:
+            geom_normal_tv = _geometry_normal_tv_loss(
+                vertices=vertices,
+                faces=faces,
+                face_adj_pairs=face_adj_pairs,
+                face_adj_edges=face_adj_edges,
+                base_face_pair_weight=base_face_pair_weight,
+                weld_index=weld_index,
+                num_weld_groups=num_weld_groups,
+                weld_group_inv_counts=weld_group_inv_counts,
+                delta=self.geom_tv_delta,
+            )
+            geom_edge_uniform = _geometry_face_edge_uniform_loss(
+                vertices=vertices,
+                faces=faces,
+                eps=self.geom_edge_uniform_eps,
+            )
+        else:
+            geom_normal_tv = torch.zeros((), device=pred.device, dtype=pred.dtype)
+            geom_edge_uniform = torch.zeros((), device=pred.device, dtype=pred.dtype)
+
         total = (self.w_photo   * photo
-               + self.w_ppisp   * p_reg)
+               + self.w_ppisp   * p_reg
+               + self.w_geom_tv * geom_normal_tv
+               + self.w_geom_edge_uniform * geom_edge_uniform)
 
         return {
             "total":     total,
             "photo":     photo.detach(),
             "ppisp_reg": p_reg.detach(),
+            "geom_normal_tv": geom_normal_tv.detach(),
+            "geom_edge_uniform": geom_edge_uniform.detach(),
         }

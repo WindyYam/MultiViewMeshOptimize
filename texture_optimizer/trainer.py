@@ -25,7 +25,7 @@ import numpy as np
 
 from .ppisp    import PPISPParams
 from .renderer import TextureMap, Rasterizer
-from .losses   import TotalLoss
+from .losses   import TotalLoss, compute_face_normals_and_double_area
 from .dataset  import ColmapScene, CameraView, load_image
 
 
@@ -65,11 +65,15 @@ class TrainConfig:
     device:           str   = "cuda" if torch.cuda.is_available() else "cpu"
     seed:             int   = 42
     learn_vignette:   bool  = True
+    ppisp_gamma:      float = 2.2
+    learn_gamma:      bool  = False
     learn_geometry:   bool  = False
     lr_geometry:      float = 1e-4
     geometry_warmup_iters: int = 1000
     geom_normal_tv_weight: float = 5e-3
     geom_normal_tv_delta:  float = 1e-3
+    geom_edge_uniform_weight: float = 0.0
+    geom_edge_uniform_eps: float = 1e-8
     geom_normal_tv_feature_sigma: float = 0.05
     geom_normal_tv_use_base_feature_weights: bool = True
     max_vertex_offset:     Optional[float] = 0.03
@@ -331,7 +335,7 @@ class TexturePPISPTrainer:
         self._base_face_pair_weight = None
         self._weld_group_inv_counts = None
         if self._face_adj_pairs is not None and self._face_adj_pairs.shape[0] > 0:
-            base_n, _ = self._compute_face_normals_and_double_area(self.base_vertices)
+            base_n, _ = compute_face_normals_and_double_area(self.base_vertices, self.faces)
             p = self._face_adj_pairs
             cos_base = (base_n[p[:, 0]] * base_n[p[:, 1]]).sum(dim=1).clamp(-1.0, 1.0)
             self._base_face_pair_d = (1.0 - cos_base).detach()
@@ -383,6 +387,8 @@ class TexturePPISPTrainer:
         self.ppisp = PPISPParams(
             num_cameras=len(scene),
             image_width=v0.W, image_height=v0.H,
+            init_gamma=config.ppisp_gamma,
+            learn_gamma=config.learn_gamma,
             learn_vignette=config.learn_vignette,
         ).to(self.device)
 
@@ -413,6 +419,10 @@ class TexturePPISPTrainer:
         self.loss_fn = TotalLoss(
             photo_weight=config.photo_weight,
             ppisp_reg_weight=config.ppisp_reg_weight,
+            geom_normal_tv_weight=config.geom_normal_tv_weight,
+            geom_normal_tv_delta=config.geom_normal_tv_delta,
+            geom_edge_uniform_weight=config.geom_edge_uniform_weight,
+            geom_edge_uniform_eps=config.geom_edge_uniform_eps,
             l1_weight=config.l1_weight,
             ssim_weight=config.ssim_weight,
             ssim_backend=config.ssim_backend,
@@ -500,7 +510,8 @@ class TexturePPISPTrainer:
         )
         if self.learn_geometry:
             print(
-                f"[Trainer] GeomPrior  : normal_tv={float(config.geom_normal_tv_weight):.4g}"
+                f"[Trainer] GeomPrior  : normal_tv={float(config.geom_normal_tv_weight):.4g}, "
+                f"edge_uniform={float(config.geom_edge_uniform_weight):.4g}"
             )
             n_adj = int(self._face_adj_pairs.shape[0]) if self._face_adj_pairs is not None else 0
             print(f"[Trainer] FaceAdj    : {n_adj:,} adjacent face pairs")
@@ -953,16 +964,6 @@ class TexturePPISPTrainer:
         edges = torch.as_tensor(pair_edge, dtype=torch.long, device=self.device)
         return pairs, edges
 
-    def _compute_face_normals_and_double_area(self, vertices: torch.Tensor):
-        f = self.faces
-        v0 = vertices[f[:, 0]]
-        v1 = vertices[f[:, 1]]
-        v2 = vertices[f[:, 2]]
-        n_raw = torch.cross(v1 - v0, v2 - v0, dim=1)
-        a2 = n_raw.norm(dim=1).clamp(min=1e-12)
-        n_unit = n_raw / a2.unsqueeze(1)
-        return n_unit, a2
-
     def current_vertices(self) -> torch.Tensor:
         if not self.learn_geometry:
             return self.base_vertices
@@ -972,52 +973,6 @@ class TexturePPISPTrainer:
         else:
             offsets = torch.tanh(offsets_full) * float(self._max_vertex_offset)
         return self.base_vertices + offsets
-
-    def _geometry_normal_tv_loss(self, vertices: torch.Tensor) -> torch.Tensor:
-        """
-        TV-like prior on face normals over adjacent faces.
-        Encourages piecewise-planar surfaces while preserving sharp edges.
-        """
-        if (not self.learn_geometry or self._face_adj_pairs is None or
-                self._face_adj_pairs.shape[0] == 0):
-            return torch.tensor(0.0, device=self.device)
-
-        n_unit, _ = self._compute_face_normals_and_double_area(vertices)
-        p = self._face_adj_pairs
-        cos_ij = (n_unit[p[:, 0]] * n_unit[p[:, 1]]).sum(dim=1).clamp(-1.0, 1.0)
-        d = 1.0 - cos_ij
-
-        delta = float(max(1e-8, self.cfg.geom_normal_tv_delta))
-        tv = torch.sqrt(d * d + delta * delta) - delta
-
-        weights = self._base_face_pair_weight
-
-        if self._face_adj_edges is not None:
-            e = self._face_adj_edges
-            if self._weld_index is None:
-                edge_len = (vertices[e[:, 0]] - vertices[e[:, 1]]).norm(dim=1).clamp(min=1e-8)
-            else:
-                # Convert per-vertex positions to welded-group positions for group-based edges.
-                n_groups = int(self._num_weld_groups)
-                group_pos = torch.zeros(
-                    (n_groups, 3), device=self.device, dtype=vertices.dtype
-                )
-                group_pos.index_add_(0, self._weld_index, vertices)
-                inv_counts = self._weld_group_inv_counts
-                if inv_counts is None:
-                    inv_counts = torch.ones(n_groups, device=self.device, dtype=vertices.dtype)
-                else:
-                    inv_counts = inv_counts.to(dtype=vertices.dtype)
-                group_pos = group_pos * inv_counts.unsqueeze(1)
-                edge_len = (group_pos[e[:, 0]] - group_pos[e[:, 1]]).norm(dim=1).clamp(min=1e-8)
-            if weights is None:
-                weights = edge_len
-            else:
-                weights = weights.to(dtype=tv.dtype) * edge_len
-
-        if weights is None:
-            return tv.mean()
-        return (weights * tv).sum() / weights.sum().clamp(min=1e-8)
 
     # ------------------------------------------------------------------
     # Render
@@ -1092,19 +1047,24 @@ class TexturePPISPTrainer:
             pred_loss = pred
             gt_loss = gt
 
-        losses = self.loss_fn(pred_loss, gt_loss, self.ppisp, mask=mesh_mask)
-        do_geom_reg = train_geom
-        if do_geom_reg:
-            vertices_now = self.current_vertices()
-            geom_normal_tv = self._geometry_normal_tv_loss(vertices_now)
-            geom_normal_tv_w = float(self.cfg.geom_normal_tv_weight)
-        else:
-            geom_normal_tv = torch.tensor(0.0, device=self.device)
-            geom_normal_tv_w = 0.0
-        total = losses["total"] + geom_normal_tv_w * geom_normal_tv
-        geom_losses = {
-            "geom_normal_tv": geom_normal_tv,
-        }
+        vertices_now = self.current_vertices() if train_geom else None
+        losses = self.loss_fn(
+            pred_loss,
+            gt_loss,
+            self.ppisp,
+            mask=mesh_mask,
+            learn_geometry=self.learn_geometry,
+            train_geometry=train_geom,
+            vertices=vertices_now,
+            faces=self.faces if train_geom else None,
+            face_adj_pairs=self._face_adj_pairs,
+            face_adj_edges=self._face_adj_edges,
+            base_face_pair_weight=self._base_face_pair_weight,
+            weld_index=self._weld_index,
+            num_weld_groups=self._num_weld_groups,
+            weld_group_inv_counts=self._weld_group_inv_counts,
+        )
+        total = losses["total"]
 
         if not torch.isfinite(total):
             self.opt_tex.zero_grad(set_to_none=True)
@@ -1118,7 +1078,8 @@ class TexturePPISPTrainer:
                 "total": float("nan"),
                 "photo": losses["photo"].detach().item(),
                 "ppisp_reg": losses["ppisp_reg"].detach().item(),
-                "geom_normal_tv": geom_normal_tv.detach().item(),
+                "geom_normal_tv": losses["geom_normal_tv"].detach().item(),
+                "geom_edge_uniform": losses["geom_edge_uniform"].detach().item(),
             }
 
         if self._grad_scaler is not None:
@@ -1151,9 +1112,7 @@ class TexturePPISPTrainer:
             self.opt_ppisp.step()
 
         out = {
-            "total": total,
             **losses,
-            **geom_losses,
         }
         return {k: v.item() if hasattr(v, "item") else v
                 for k, v in out.items()}
@@ -1193,7 +1152,7 @@ class TexturePPISPTrainer:
               f"({cfg.warmup_iters} warmup) ...\n")
 
         running = {k: 0.0 for k in (
-            "total", "photo", "ppisp_reg", "geom_normal_tv"
+            "total", "photo", "ppisp_reg", "geom_normal_tv", "geom_edge_uniform"
         )}
         t_iter  = time.time()
         try:
@@ -1232,8 +1191,11 @@ class TexturePPISPTrainer:
                     w_normal_tv = (float(cfg.geom_normal_tv_weight) * avg["geom_normal_tv"]
                                    if self.learn_geometry and self.iter >= cfg.geometry_warmup_iters
                                    else 0.0)
-                    w_total = w_photo + w_ppisp_reg + w_normal_tv
-                    geom_txt = (f"w_nTV={w_normal_tv:.3e}"
+                    w_edge_uniform = (float(cfg.geom_edge_uniform_weight) * avg["geom_edge_uniform"]
+                                      if self.learn_geometry and self.iter >= cfg.geometry_warmup_iters
+                                      else 0.0)
+                    w_total = w_photo + w_ppisp_reg + w_normal_tv + w_edge_uniform
+                    geom_txt = (f"w_nTV={w_normal_tv:.3e} w_eUni={w_edge_uniform:.3e}"
                                 if self.learn_geometry else "")
                     print(
                         f"  {self.iter+1:5d}/{cfg.num_iterations}  [{mode}]  "

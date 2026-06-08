@@ -36,21 +36,30 @@ class PPISPParams(nn.Module):
         image_width: int,
         image_height: int,
         init_gamma: float = 2.2,
+        learn_gamma: bool = False,
         learn_vignette: bool = True,
     ):
         super().__init__()
         self.num_cameras = num_cameras
         self.W = image_width
         self.H = image_height
+        self.learn_gamma = learn_gamma
         self.learn_vignette = learn_vignette
 
         # --- exposure in log-space (numerically stable, symmetric around 0) ---
         self.log_exposure = nn.Parameter(torch.zeros(num_cameras))
 
-        # gamma: learn residual around init_gamma  →  gamma = softplus(raw) + 0.5
-        self.gamma_raw = nn.Parameter(
-            torch.full((num_cameras,), self._gamma_to_raw(init_gamma))
-        )
+        # Gamma is fixed to a normal display value by default (2.2).
+        # Set learn_gamma=True to optimize per-camera gamma instead.
+        if self.learn_gamma:
+            self.gamma_raw = nn.Parameter(
+                torch.full((num_cameras,), self._gamma_to_raw(init_gamma))
+            )
+        else:
+            self.register_buffer(
+                "gamma_const",
+                torch.full((num_cameras,), float(init_gamma), dtype=torch.float32),
+            )
 
         # white balance gains (log-space per channel so they stay > 0)
         self.log_wb = nn.Parameter(torch.zeros(num_cameras, 3))
@@ -85,7 +94,9 @@ class PPISPParams(nn.Module):
 
     def gamma(self) -> torch.Tensor:
         """Return positive gamma values  (N,)"""
-        return F.softplus(self.gamma_raw) + 0.5      # in (0.5, ∞)
+        if self.learn_gamma:
+            return F.softplus(self.gamma_raw) + 0.5      # in (0.5, ∞)
+        return self.gamma_const
 
     def wb_gains(self) -> torch.Tensor:
         """Return positive WB gains  (N, 3)"""
@@ -136,7 +147,10 @@ class PPISPParams(nn.Module):
 
         # 4) Gamma compression with sign-preserving safe power.
         # Avoids hard clamping so HDR gradients continue to flow.
-        g = F.softplus(self.gamma_raw[cam_idx]) + 0.5
+        if self.learn_gamma:
+            g = F.softplus(self.gamma_raw[cam_idx]) + 0.5
+        else:
+            g = self.gamma_const[cam_idx]
         x = torch.sign(x) * torch.pow(torch.abs(x) + 1e-8, 1.0 / g)
 
         # 5) Brightness + Contrast (applied in [0,1] space)

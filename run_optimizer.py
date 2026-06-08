@@ -60,7 +60,7 @@ def parse_args():
     p.add_argument("--ssim_backend", type=str, default="auto",
                    choices=["auto", "native", "msssim"],
                    help="SSIM backend: auto (prefer pytorch_msssim), native, or msssim")
-    p.add_argument("--lr_geom",     type=float, default=2e-4,
+    p.add_argument("--lr_geom",     type=float, default=1e-3,
                    help="Geometry (vertex offsets) learning rate")
     p.add_argument("--warmup",      type=int,   default=500,
                    help="Warmup iterations (PPISP only, texture frozen)")
@@ -74,8 +74,12 @@ def parse_args():
                    help="Geometry offset dtype (auto follows AMP on CUDA; lowers VRAM when fp16/bf16)")
     p.add_argument("--geom_optimizer", type=str, default="adam", choices=["adam", "sgd"],
                    help="Geometry optimizer (sgd reduces VRAM vs adam)")
-    p.add_argument("--geom_tv_weight", type=float, default=5e-1,
+    p.add_argument("--geom_tv_weight", type=float, default=10,
                    help="Weight for geometry normal-TV regularization")
+    p.add_argument("--geom_edge_uniform_weight", type=float, default=1e-1,
+                   help="Weight for per-face edge-length uniformity regularization")
+    p.add_argument("--geom_edge_uniform_eps", type=float, default=1e-8,
+                   help="Numerical epsilon for edge uniformity regularization")
     p.add_argument("--learn_geometry", action="store_true",
                    help="Enable differentiable mesh geometry updates")
     p.add_argument("--max_vertex_offset", type=float, default=0,
@@ -84,6 +88,10 @@ def parse_args():
                    help="Disable welding duplicate-position vertices for geometry optimization")
     p.add_argument("--no_vignette", action="store_true",
                    help="Disable per-camera vignette learning")
+    p.add_argument("--ppisp_gamma", type=float, default=2.2,
+                   help="PPISP gamma value (used as fixed gamma by default)")
+    p.add_argument("--learn_gamma", action="store_true",
+                   help="Enable per-camera PPISP gamma learning (default: fixed --ppisp_gamma)")
     p.add_argument("--resume",      type=str,   default=None,
                    help="Resume from checkpoint file")
     p.add_argument("--device",      type=str,   default=None,
@@ -172,12 +180,16 @@ def main():
         cfg.ssim_backend    = args.ssim_backend
         cfg.lr_geometry     = args.lr_geom
         cfg.learn_vignette  = not args.no_vignette
+        cfg.ppisp_gamma     = args.ppisp_gamma
+        cfg.learn_gamma     = args.learn_gamma
         cfg.learn_geometry  = args.learn_geometry
         cfg.geometry_warmup_iters = args.geom_warmup
         cfg.geom_update_every = max(1, args.geom_update_every)
         cfg.geometry_dtype  = args.geom_dtype
         cfg.geom_optimizer  = args.geom_optimizer
         cfg.geom_normal_tv_weight = args.geom_tv_weight
+        cfg.geom_edge_uniform_weight = args.geom_edge_uniform_weight
+        cfg.geom_edge_uniform_eps = args.geom_edge_uniform_eps
         cfg.max_vertex_offset     = (args.max_vertex_offset
                          if args.max_vertex_offset > 0 else None)
         cfg.weld_geometry_vertices = not args.no_weld_geometry
@@ -254,12 +266,16 @@ def main():
     cfg.ssim_backend    = args.ssim_backend
     cfg.lr_geometry     = args.lr_geom
     cfg.learn_vignette  = not args.no_vignette
+    cfg.ppisp_gamma     = args.ppisp_gamma
+    cfg.learn_gamma     = args.learn_gamma
     cfg.learn_geometry  = args.learn_geometry
     cfg.geometry_warmup_iters = args.geom_warmup
     cfg.geom_update_every = max(1, args.geom_update_every)
     cfg.geometry_dtype  = args.geom_dtype
     cfg.geom_optimizer  = args.geom_optimizer
     cfg.geom_normal_tv_weight = args.geom_tv_weight
+    cfg.geom_edge_uniform_weight = args.geom_edge_uniform_weight
+    cfg.geom_edge_uniform_eps = args.geom_edge_uniform_eps
     cfg.max_vertex_offset     = (args.max_vertex_offset
                                  if args.max_vertex_offset > 0 else None)
     cfg.weld_geometry_vertices = not args.no_weld_geometry
