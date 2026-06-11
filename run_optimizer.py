@@ -60,7 +60,7 @@ def parse_args():
     p.add_argument("--ssim_backend", type=str, default="auto",
                    choices=["auto", "native", "msssim"],
                    help="SSIM backend: auto (prefer pytorch_msssim), native, or msssim")
-    p.add_argument("--lr_geom",     type=float, default=1e-3,
+    p.add_argument("--lr_geom",     type=float, default=5e-4,
                    help="Geometry (vertex offsets) learning rate")
     p.add_argument("--warmup",      type=int,   default=500,
                    help="Warmup iterations (PPISP only, texture frozen)")
@@ -74,9 +74,9 @@ def parse_args():
                    help="Geometry offset dtype (auto follows AMP on CUDA; lowers VRAM when fp16/bf16)")
     p.add_argument("--geom_optimizer", type=str, default="adam", choices=["adam", "sgd"],
                    help="Geometry optimizer (sgd reduces VRAM vs adam)")
-    p.add_argument("--geom_tv_weight", type=float, default=5,
+    p.add_argument("--geom_tv_weight", type=float, default=1,
                    help="Weight for geometry normal-TV regularization")
-    p.add_argument("--geom_edge_uniform_weight", type=float, default=5e-2,
+    p.add_argument("--geom_edge_uniform_weight", type=float, default=1e-2,
                    help="Weight for per-face edge-length uniformity regularization")
     p.add_argument("--geom_edge_uniform_eps", type=float, default=1e-8,
                    help="Numerical epsilon for edge uniformity regularization")
@@ -134,6 +134,8 @@ def parse_args():
                    help="Filesystem cache directory for GT images (default: <output>/image_cache)")
     p.add_argument("--tex_linear", action="store_true",
                    help="Treat input texture as linear and export PNG without sRGB encoding")
+    p.add_argument("--tex_seam_pad", type=int, default=12,
+                   help="UV seam padding in pixels applied on export texture to reduce visible seams")
     return p.parse_args()
 
 
@@ -210,6 +212,7 @@ def main():
         cfg.image_fs_cache       = not args.no_image_fs_cache
         cfg.image_cache_dir      = args.image_cache_dir
         cfg.tex_linear     = args.tex_linear
+        cfg.tex_seam_pad_px = max(0, int(args.tex_seam_pad))
         cfg.device          = str(device)
         cfg.log_every       = max(1, args.iters // 30)
         cfg.save_every      = max(1, args.iters // 5)
@@ -296,6 +299,7 @@ def main():
     cfg.image_fs_cache       = not args.no_image_fs_cache
     cfg.image_cache_dir      = args.image_cache_dir
     cfg.tex_linear     = args.tex_linear
+    cfg.tex_seam_pad_px = max(0, int(args.tex_seam_pad))
     cfg.device          = str(device)
 
     trainer = TexturePPISPTrainer(scene, cfg)
