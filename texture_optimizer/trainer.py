@@ -60,7 +60,7 @@ class TrainConfig:
     geom_optimizer:   str   = "adam"   # adam, sgd
 
     log_every:        int   = 50
-    save_every:       int   = 1000
+    save_every:       int   = 2000
     output_dir:       str   = "outputs"
     device:           str   = "cuda" if torch.cuda.is_available() else "cpu"
     seed:             int   = 42
@@ -95,7 +95,6 @@ class TrainConfig:
     image_loader_workers:  int   = 2
     image_fs_cache:        bool  = True
     image_cache_dir:       Optional[str] = None
-    tex_linear:            bool  = False
     tex_seam_pad_px:       int   = 12
 
 

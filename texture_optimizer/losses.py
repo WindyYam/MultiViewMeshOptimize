@@ -162,31 +162,9 @@ def _geometry_normal_tv_loss(
     delta_val = float(max(1e-8, delta))
     tv = torch.sqrt(d * d + delta_val * delta_val) - delta_val
 
-    weights = base_face_pair_weight
-
-    if face_adj_edges is not None:
-        e = face_adj_edges
-        if weld_index is None:
-            edge_len = (vertices[e[:, 0]] - vertices[e[:, 1]]).norm(dim=1).clamp(min=1e-8)
-        else:
-            n_groups = int(num_weld_groups) if num_weld_groups is not None else int(weld_index.max().item() + 1)
-            group_pos = torch.zeros((n_groups, 3), device=vertices.device, dtype=vertices.dtype)
-            group_pos.index_add_(0, weld_index, vertices)
-            inv_counts = weld_group_inv_counts
-            if inv_counts is None:
-                inv_counts = torch.ones(n_groups, device=vertices.device, dtype=vertices.dtype)
-            else:
-                inv_counts = inv_counts.to(device=vertices.device, dtype=vertices.dtype)
-            group_pos = group_pos * inv_counts.unsqueeze(1)
-            edge_len = (group_pos[e[:, 0]] - group_pos[e[:, 1]]).norm(dim=1).clamp(min=1e-8)
-        if weights is None:
-            weights = edge_len
-        else:
-            weights = weights.to(device=vertices.device, dtype=tv.dtype) * edge_len
-
-    if weights is None:
-        return tv.mean()
-    return (weights * tv).sum() / weights.sum().clamp(min=1e-8)
+    # Unweighted total variance over adjacent face normals, scaled by face count.
+    face_count = max(1, int(faces.shape[0]))
+    return tv.sum() / float(face_count)
 
 
 def _geometry_face_edge_uniform_loss(

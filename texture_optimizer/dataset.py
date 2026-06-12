@@ -357,7 +357,7 @@ def _load_colmap_sparse(sparse_dir: str) -> tuple:
 # PLY mesh loader
 # ---------------------------------------------------------------------------
 
-def load_ply(ply_path: str, tex_linear: bool = False) -> MeshData:
+def load_ply(ply_path: str) -> MeshData:
     """
     Load a .ply file (binary_little_endian or ASCII) into MeshData.
 
@@ -602,13 +602,10 @@ def load_ply(ply_path: str, tex_linear: bool = False) -> MeshData:
         if os.path.exists(tex_path):
             img = _open_rgb_image(tex_path)
             tex_np = np.array(img, dtype=np.float32) / 255.0
-            if not tex_linear:
-                tex_np = _srgb_to_linear_np(tex_np)
+            # Assume texture files are sRGB; convert to linear for internal use.
+            tex_np = _srgb_to_linear_np(tex_np)
             tex_image = torch.from_numpy(tex_np.astype(np.float32, copy=False))
-            if not tex_linear:
-                print(f"[load_ply]   Loaded texture: {tex_file}  {tex_image.shape} (sRGB -> linear)")
-            else:
-                print(f"[load_ply]   Loaded texture: {tex_file}  {tex_image.shape}")
+            print(f"[load_ply]   Loaded texture: {tex_file}  {tex_image.shape} (sRGB -> linear)")
         else:
             print(f"[load_ply]   WARNING: texture file not found: {tex_path}")
     elif vert_colors is not None and faces.shape[0] > 0:
@@ -668,7 +665,7 @@ def _bake_vertex_colors_to_texture(
 # OBJ mesh loader (minimal, no external deps)
 # ---------------------------------------------------------------------------
 
-def load_obj(obj_path: str, tex_linear: bool = False) -> MeshData:
+def load_obj(obj_path: str) -> MeshData:
     """
     Load a .obj file with UV coordinates.
     Returns a MeshData with per-vertex-position and per-face-vertex UVs.
@@ -743,8 +740,8 @@ def load_obj(obj_path: str, tex_linear: bool = False) -> MeshData:
     if tex_path and os.path.exists(tex_path):
         img = _open_rgb_image(tex_path)
         tex_np = np.array(img, dtype=np.float32) / 255.0
-        if not tex_linear:
-            tex_np = _srgb_to_linear_np(tex_np)
+        # Assume texture files are sRGB; convert to linear for internal use.
+        tex_np = _srgb_to_linear_np(tex_np)
         tex_image = torch.from_numpy(tex_np.astype(np.float32, copy=False))
 
     return MeshData(
@@ -759,13 +756,13 @@ def load_obj(obj_path: str, tex_linear: bool = False) -> MeshData:
 # Main scene dataset
 # ---------------------------------------------------------------------------
 
-def _find_and_load_mesh(scene_root, mesh_path=None, tex_linear: bool = False):
+def _find_and_load_mesh(scene_root, mesh_path=None):
     """Find and load a mesh. Supports .ply and .obj. mesh_path overrides auto-search."""
     from pathlib import Path as _Path
     if mesh_path is not None:
         p = _Path(mesh_path)
         print(f"[ColmapScene] Loading mesh: {p}")
-        mesh = load_ply(str(p), tex_linear=tex_linear) if p.suffix.lower() == ".ply" else load_obj(str(p), tex_linear=tex_linear)
+        mesh = load_ply(str(p)) if p.suffix.lower() == ".ply" else load_obj(str(p))
         print(f"[ColmapScene]   {mesh.vertices.shape[0]} verts, {mesh.faces.shape[0]} faces")
         return mesh
     mesh_dir = scene_root / "mesh"
@@ -782,7 +779,7 @@ def _find_and_load_mesh(scene_root, mesh_path=None, tex_linear: bool = False):
     ply_files = [c for c in candidates if c.suffix.lower() == ".ply"]
     chosen = ply_files[0] if ply_files else candidates[0]
     print(f"[ColmapScene] Loading mesh: {chosen}")
-    mesh = load_ply(str(chosen), tex_linear=tex_linear) if chosen.suffix.lower() == ".ply" else load_obj(str(chosen), tex_linear=tex_linear)
+    mesh = load_ply(str(chosen)) if chosen.suffix.lower() == ".ply" else load_obj(str(chosen))
     print(f"[ColmapScene]   {mesh.vertices.shape[0]} verts, {mesh.faces.shape[0]} faces")
     return mesh
 
@@ -920,7 +917,6 @@ class ColmapScene:
         image_scale:  float = 1.0,
         max_cameras:  Optional[int] = None,
         mesh_path:    Optional[str] = None,
-        tex_linear:   bool = False,
         uv_unwrap_mode: str = "none",
         uv_unwrap_size: int = 0,
         device:       str = "cpu",
@@ -998,7 +994,7 @@ class ColmapScene:
             print(f"[ColmapScene]   Skipped {skipped_missing_images} cameras with missing image files")
 
         # --- Load mesh ---
-        self.mesh = _find_and_load_mesh(self.root, mesh_path, tex_linear=tex_linear)
+        self.mesh = _find_and_load_mesh(self.root, mesh_path)
         unwrap_mode = str(uv_unwrap_mode or "none").lower()
         if unwrap_mode in ("open3d_xatlas", "xatlas"):
             unwrap_size = int(uv_unwrap_size)

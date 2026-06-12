@@ -176,19 +176,35 @@ class TextureExportMixin:
         # Optimised texture
         tex_np = self.texture.as_image().cpu().numpy()
         tex_np = self._seam_pad_texture(tex_np)
-        if not getattr(self.cfg, "tex_linear", False):
-            tex_np = np.clip(tex_np, 0.0, 1.0)
-            tex_np = np.where(
-                tex_np <= 0.0031308,
-                12.92 * tex_np,
-                1.055 * np.power(tex_np, 1.0 / 2.4) - 0.055,
-            )
+        # Bake average PPISP parameters (exposure, WB, gamma, brightness, contrast)
+        try:
+            with np.errstate(all='ignore'):
+                import torch
+                if hasattr(self, 'ppisp') and self.ppisp is not None:
+                    with torch.no_grad():
+                        exp = float(self.ppisp.exposure().mean().cpu().item())
+                        wb = self.ppisp.wb_gains().mean(dim=0).cpu().numpy()  # (3,)
+                        gamma = float(self.ppisp.gamma().mean().cpu().item())
+                        contrast = float(self.ppisp.contrast().mean().cpu().item())
+                        brightness = float(self.ppisp.brightness.mean().cpu().item())
+
+                    # apply exposure and white balance (linear domain)
+                    tex_np = tex_np * (exp * wb.reshape((1, 1, 3)))
+
+                    # apply gamma compression (sign-preserving, texture is non-negative)
+                    # avoid negative/zero issues
+                    tex_np = np.sign(tex_np) * np.power(np.abs(tex_np) + 1e-8, 1.0 / max(1e-8, gamma))
+
+                    # brightness & contrast applied in [0,1] domain
+                    tex_np = contrast * (tex_np - 0.5) + 0.5 + brightness
+                    # clamp to [0,1]
+                    tex_np = np.clip(tex_np, 0.0, 1.0)
+                    print(f"[Export] Baked PPISP avg: exp={exp:.3f} gamma={gamma:.3f} wb={wb.tolist()} C={contrast:.3f} B={brightness:+.3f}")
+        except Exception as e:
+            print(f"[Export] PPISP bake skipped: {e}")
         Image.fromarray((tex_np * 255).astype(np.uint8)).save(
             os.path.join(out, "optimized_texture.png"))
-        if not getattr(self.cfg, "tex_linear", False):
-            print(f"[Export] Texture  -> {out}/optimized_texture.png (sRGB-encoded)")
-        else:
-            print(f"[Export] Texture  -> {out}/optimized_texture.png")
+        print(f"[Export] Texture  -> {out}/optimized_texture.png (sRGB-encoded)")
 
         # PPISP params
         with open(os.path.join(out, "ppisp_params.json"), "w") as f:

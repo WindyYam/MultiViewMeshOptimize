@@ -33,7 +33,7 @@ def parse_args():
                    help="Total training iterations")
     p.add_argument("--scale",       type=float, default=1,
                    help="GT image downscale factor (0.5 = half-res, faster)")
-    p.add_argument("--tex_res",     type=int,   default=1024,
+    p.add_argument("--tex_res",     type=int,   default=8192,
                    help="Target output texture long side (aspect ratio preserved from input texture when available)")
     p.add_argument("--uv_unwrap", action="store_true",
                    help="Run Open3D xatlas UV unwrap on input mesh before training")
@@ -43,7 +43,7 @@ def parse_args():
                    help="Texture optimizer (sgd reduces VRAM vs adam)")
     p.add_argument("--progressive_tex", action="store_true",
                    help="Use progressive texture upscaling during training (1/2 -> full)")
-    p.add_argument("--lr_tex",      type=float, default=2e-3,
+    p.add_argument("--lr_tex",      type=float, default=1e-4,
                    help="Texture learning rate")
     p.add_argument("--lr_ppisp",    type=float, default=3e-3,
                    help="PPISP learning rate")
@@ -60,7 +60,7 @@ def parse_args():
     p.add_argument("--ssim_backend", type=str, default="auto",
                    choices=["auto", "native", "msssim"],
                    help="SSIM backend: auto (prefer pytorch_msssim), native, or msssim")
-    p.add_argument("--lr_geom",     type=float, default=5e-4,
+    p.add_argument("--lr_geom",     type=float, default=1e-4,
                    help="Geometry (vertex offsets) learning rate")
     p.add_argument("--warmup",      type=int,   default=500,
                    help="Warmup iterations (PPISP only, texture frozen)")
@@ -76,7 +76,7 @@ def parse_args():
                    help="Geometry optimizer (sgd reduces VRAM vs adam)")
     p.add_argument("--geom_tv_weight", type=float, default=1,
                    help="Weight for geometry normal-TV regularization")
-    p.add_argument("--geom_edge_uniform_weight", type=float, default=1e-2,
+    p.add_argument("--geom_edge_uniform_weight", type=float, default=1e-1,
                    help="Weight for per-face edge-length uniformity regularization")
     p.add_argument("--geom_edge_uniform_eps", type=float, default=1e-8,
                    help="Numerical epsilon for edge uniformity regularization")
@@ -132,8 +132,6 @@ def parse_args():
                    help="Disable filesystem cache of resized GT images")
     p.add_argument("--image_cache_dir", type=str, default=None,
                    help="Filesystem cache directory for GT images (default: <output>/image_cache)")
-    p.add_argument("--tex_linear", action="store_true",
-                   help="Treat input texture as linear and export PNG without sRGB encoding")
     p.add_argument("--tex_seam_pad", type=int, default=12,
                    help="UV seam padding in pixels applied on export texture to reduce visible seams")
     return p.parse_args()
@@ -211,7 +209,6 @@ def main():
         cfg.image_loader_workers = args.image_loader_workers
         cfg.image_fs_cache       = not args.no_image_fs_cache
         cfg.image_cache_dir      = args.image_cache_dir
-        cfg.tex_linear     = args.tex_linear
         cfg.tex_seam_pad_px = max(0, int(args.tex_seam_pad))
         cfg.device          = str(device)
         cfg.log_every       = max(1, args.iters // 30)
@@ -234,7 +231,6 @@ def main():
         image_scale=args.scale,
         max_cameras=args.max_cameras,
         mesh_path=args.mesh,
-        tex_linear=args.tex_linear,
         uv_unwrap_mode=("open3d_xatlas" if args.uv_unwrap else "none"),
         uv_unwrap_size=args.tex_res,
         device=str(device),
@@ -298,7 +294,6 @@ def main():
     cfg.image_loader_workers = args.image_loader_workers
     cfg.image_fs_cache       = not args.no_image_fs_cache
     cfg.image_cache_dir      = args.image_cache_dir
-    cfg.tex_linear     = args.tex_linear
     cfg.tex_seam_pad_px = max(0, int(args.tex_seam_pad))
     cfg.device          = str(device)
 
