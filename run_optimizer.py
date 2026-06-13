@@ -43,7 +43,7 @@ def parse_args():
                    help="Texture optimizer (sgd reduces VRAM vs adam)")
     p.add_argument("--progressive_tex", action="store_true",
                    help="Use progressive texture upscaling during training (1/2 -> full)")
-    p.add_argument("--lr_tex",      type=float, default=1e-4,
+    p.add_argument("--lr_tex",      type=float, default=1e-3,
                    help="Texture learning rate")
     p.add_argument("--lr_ppisp",    type=float, default=3e-3,
                    help="PPISP learning rate")
