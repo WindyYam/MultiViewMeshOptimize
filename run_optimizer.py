@@ -74,9 +74,9 @@ def parse_args():
                    help="Geometry offset dtype (auto follows AMP on CUDA; lowers VRAM when fp16/bf16)")
     p.add_argument("--geom_optimizer", type=str, default="adam", choices=["adam", "sgd"],
                    help="Geometry optimizer (sgd reduces VRAM vs adam)")
-    p.add_argument("--geom_tv_weight", type=float, default=1,
+    p.add_argument("--geom_tv_weight", type=float, default=1e-1,
                    help="Weight for geometry normal-TV regularization")
-    p.add_argument("--geom_edge_uniform_weight", type=float, default=1e-1,
+    p.add_argument("--geom_edge_uniform_weight", type=float, default=1e-2,
                    help="Weight for per-face edge-length uniformity regularization")
     p.add_argument("--geom_edge_uniform_eps", type=float, default=1e-8,
                    help="Numerical epsilon for edge uniformity regularization")
@@ -132,8 +132,10 @@ def parse_args():
                    help="Disable filesystem cache of resized GT images")
     p.add_argument("--image_cache_dir", type=str, default=None,
                    help="Filesystem cache directory for GT images (default: <output>/image_cache)")
-    p.add_argument("--tex_seam_pad", type=int, default=12,
+    p.add_argument("--tex_seam_pad", type=int, default=10,
                    help="UV seam padding in pixels applied on export texture to reduce visible seams")
+    p.add_argument("--alter_every", type=int, default=200,
+                   help="Alternate between texture and geometry updates every N iterations (0=disabled)")
     return p.parse_args()
 
 
@@ -210,6 +212,7 @@ def main():
         cfg.image_fs_cache       = not args.no_image_fs_cache
         cfg.image_cache_dir      = args.image_cache_dir
         cfg.tex_seam_pad_px = max(0, int(args.tex_seam_pad))
+        cfg.alter_every = max(0, int(args.alter_every))
         cfg.device          = str(device)
         cfg.log_every       = max(1, args.iters // 30)
         cfg.save_every      = max(1, args.iters // 5)
@@ -295,6 +298,7 @@ def main():
     cfg.image_fs_cache       = not args.no_image_fs_cache
     cfg.image_cache_dir      = args.image_cache_dir
     cfg.tex_seam_pad_px = max(0, int(args.tex_seam_pad))
+    cfg.alter_every = max(0, int(args.alter_every))
     cfg.device          = str(device)
 
     trainer = TexturePPISPTrainer(scene, cfg)

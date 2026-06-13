@@ -96,6 +96,9 @@ class TrainConfig:
     image_fs_cache:        bool  = True
     image_cache_dir:       Optional[str] = None
     tex_seam_pad_px:       int   = 12
+    # If >0, alternate between texture and geometry updates every N iterations
+    # during the joint phase to avoid them fighting each other.
+    alter_every:           int   = 0
 
 
 class AsyncImageCache:
@@ -502,6 +505,7 @@ class TexturePPISPTrainer(TextureExportMixin):
             "[Trainer] UpdateFreq : "
             f"tex every {max(1, int(config.tex_update_every))} it, "
             f"geom every {max(1, int(config.geom_update_every))} it"
+            + (f", alter every {int(config.alter_every)} it" if int(getattr(config, 'alter_every', 0)) > 0 else "")
         )
         print(
             f"[Trainer] ImgCache   : cpu={int(config.image_cpu_cache_size)} "
@@ -1029,6 +1033,20 @@ class TexturePPISPTrainer(TextureExportMixin):
             and (self.iter >= self.cfg.geometry_warmup_iters)
             and ((self.iter - self.cfg.geometry_warmup_iters) % geom_every == 0)
         )
+        # Optionally alternate between texture and geometry updates in blocks
+        # of `alter_every` iterations once both warmups have completed. When
+        # enabled, only one of texture/geometry is trained in each block.
+        alter_every = int(getattr(self.cfg, "alter_every", 0) or 0)
+        if alter_every > 0 and self.learn_geometry:
+            start = max(int(self.cfg.warmup_iters), int(self.cfg.geometry_warmup_iters))
+            if self.iter >= start:
+                block = ((self.iter - start) // alter_every) & 1
+                if block == 0:
+                    # texture block: disable geometry training this iteration
+                    train_geom = False
+                else:
+                    # geometry block: disable texture training this iteration
+                    train_tex = False
         self.geometry_offsets.requires_grad_(train_geom)
 
         self.opt_tex.zero_grad(set_to_none=True)

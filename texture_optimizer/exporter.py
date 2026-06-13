@@ -116,6 +116,10 @@ class TextureExportMixin:
 
         img = np.ascontiguousarray(tex_np.copy())
         valid = valid_mask.astype(bool).copy()
+        # Keep a copy of the original image and original valid mask so
+        # we never overwrite texels that were valid in the input.
+        orig_img = img.copy()
+        orig_valid = valid.copy()
         H, W = valid.shape
         if H == 0 or W == 0:
             return img
@@ -152,6 +156,10 @@ class TextureExportMixin:
 
             img[fillable] = (accum[fillable] / np.maximum(count[fillable, None], 1e-8)).astype(img.dtype)
             valid[fillable] = True
+
+        # Ensure any texels that were originally valid are preserved
+        # (prevent accidental overwriting due to numeric ops).
+        img[orig_valid] = orig_img[orig_valid]
 
         return img
 
