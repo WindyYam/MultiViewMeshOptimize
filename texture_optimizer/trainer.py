@@ -524,7 +524,7 @@ class TexturePPISPTrainer(TextureExportMixin):
     def _create_tex_optimizer(self):
         mode = str(self.cfg.tex_optimizer).lower()
         if mode == "sgd":
-            return optim.SGD(self.texture.parameters(), lr=self.cfg.lr_texture, momentum=0.0)
+            return optim.SGD(self.texture.parameters(), lr=self.cfg.lr_texture, momentum=0.9, nesterov=True)
         return self._create_adam(
             self.texture.parameters(),
             lr=self.cfg.lr_texture,
@@ -535,7 +535,7 @@ class TexturePPISPTrainer(TextureExportMixin):
     def _create_geom_optimizer(self):
         mode = str(self.cfg.geom_optimizer).lower()
         if mode == "sgd":
-            return optim.SGD([self.geometry_offsets], lr=self.cfg.lr_geometry, momentum=0.0)
+            return optim.SGD([self.geometry_offsets], lr=self.cfg.lr_geometry, momentum=0.9, nesterov=True)
         return self._create_adam([self.geometry_offsets], lr=self.cfg.lr_geometry)
 
     def _resolve_texture_dtype(self, mode: str):

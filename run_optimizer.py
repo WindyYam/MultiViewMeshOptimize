@@ -134,7 +134,7 @@ def parse_args():
                    help="Filesystem cache directory for GT images (default: <output>/image_cache)")
     p.add_argument("--tex_seam_pad", type=int, default=10,
                    help="UV seam padding in pixels applied on export texture to reduce visible seams")
-    p.add_argument("--alter_every", type=int, default=200,
+    p.add_argument("--alter_every", type=int, default=0,
                    help="Alternate between texture and geometry updates every N iterations (0=disabled)")
     return p.parse_args()
 
