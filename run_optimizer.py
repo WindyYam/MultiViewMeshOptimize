@@ -136,6 +136,24 @@ def parse_args():
                    help="UV seam padding in pixels applied on export texture to reduce visible seams")
     p.add_argument("--alter_every", type=int, default=0,
                    help="Alternate between texture and geometry updates every N iterations (0=disabled)")
+    p.add_argument("--topology_adapt_every", type=int, default=0,
+                   help="Run adaptive topology update every N iterations (0=disabled)")
+    p.add_argument("--topology_error_beta", type=float, default=0.9,
+                   help="EMA factor for per-face error used by topology adaptation")
+    p.add_argument("--topology_split_quantile", type=float, default=0.9,
+                   help="Split faces with error above this quantile")
+    p.add_argument("--topology_merge_quantile", type=float, default=0.2,
+                   help="Collapse faces with error below this quantile")
+    p.add_argument("--topology_max_splits", type=int, default=32768,
+                   help="Max faces to split per topology event")
+    p.add_argument("--topology_max_merges", type=int, default=32768,
+                   help="Max low-error faces used for edge-collapse per topology event")
+    p.add_argument("--topology_start_iter", type=int, default=None,
+                   help="Iteration to start topology adaptation (default: after warmups)")
+    p.add_argument("--topology_min_faces", type=int, default=128,
+                   help="Minimum face count required to run topology adaptation")
+    p.add_argument("--topology_max_faces", type=int, default=0,
+                   help="Hard cap on face count after adaptation (0=disabled)")
     return p.parse_args()
 
 
@@ -213,6 +231,15 @@ def main():
         cfg.image_cache_dir      = args.image_cache_dir
         cfg.tex_seam_pad_px = max(0, int(args.tex_seam_pad))
         cfg.alter_every = max(0, int(args.alter_every))
+        cfg.topology_adapt_every = max(0, int(args.topology_adapt_every))
+        cfg.topology_error_beta = float(args.topology_error_beta)
+        cfg.topology_split_quantile = float(args.topology_split_quantile)
+        cfg.topology_merge_quantile = float(args.topology_merge_quantile)
+        cfg.topology_max_splits = max(0, int(args.topology_max_splits))
+        cfg.topology_max_merges = max(0, int(args.topology_max_merges))
+        cfg.topology_start_iter = args.topology_start_iter
+        cfg.topology_min_faces = max(4, int(args.topology_min_faces))
+        cfg.topology_max_faces = max(0, int(args.topology_max_faces))
         cfg.device          = str(device)
         cfg.log_every       = max(1, args.iters // 30)
         cfg.save_every      = max(1, args.iters // 5)
@@ -299,6 +326,15 @@ def main():
     cfg.image_cache_dir      = args.image_cache_dir
     cfg.tex_seam_pad_px = max(0, int(args.tex_seam_pad))
     cfg.alter_every = max(0, int(args.alter_every))
+    cfg.topology_adapt_every = max(0, int(args.topology_adapt_every))
+    cfg.topology_error_beta = float(args.topology_error_beta)
+    cfg.topology_split_quantile = float(args.topology_split_quantile)
+    cfg.topology_merge_quantile = float(args.topology_merge_quantile)
+    cfg.topology_max_splits = max(0, int(args.topology_max_splits))
+    cfg.topology_max_merges = max(0, int(args.topology_max_merges))
+    cfg.topology_start_iter = args.topology_start_iter
+    cfg.topology_min_faces = max(4, int(args.topology_min_faces))
+    cfg.topology_max_faces = max(0, int(args.topology_max_faces))
     cfg.device          = str(device)
 
     trainer = TexturePPISPTrainer(scene, cfg)

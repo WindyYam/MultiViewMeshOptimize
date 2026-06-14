@@ -13,7 +13,7 @@ import os, math, time, random, hashlib
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional, List, Callable
+from typing import Optional, List, Callable, Tuple
 from contextlib import nullcontext
 
 import torch
@@ -99,6 +99,16 @@ class TrainConfig:
     # If >0, alternate between texture and geometry updates every N iterations
     # during the joint phase to avoid them fighting each other.
     alter_every:           int   = 0
+    # Adaptive topology update: split high-error faces, collapse low-error faces.
+    topology_adapt_every:  int   = 0
+    topology_error_beta:   float = 0.9
+    topology_split_quantile: float = 0.9
+    topology_merge_quantile: float = 0.2
+    topology_max_splits:   int   = 128
+    topology_max_merges:   int   = 128
+    topology_start_iter:   Optional[int] = None
+    topology_min_faces:    int   = 128
+    topology_max_faces:    int   = 0
 
 
 class AsyncImageCache:
@@ -370,6 +380,12 @@ class TexturePPISPTrainer(TextureExportMixin):
         else:
             self._base_edge_lengths = None
             self._vertex_degree = None
+        self._face_error_ema = torch.zeros(
+            int(self.faces.shape[0]),
+            device=self.device,
+            dtype=self.base_vertices.dtype,
+        )
+        self._topology_events = 0
 
         # ---- Texture ----
         self._full_tex_H = int(config.tex_H)
@@ -507,6 +523,17 @@ class TexturePPISPTrainer(TextureExportMixin):
             f"geom every {max(1, int(config.geom_update_every))} it"
             + (f", alter every {int(config.alter_every)} it" if int(getattr(config, 'alter_every', 0)) > 0 else "")
         )
+        if int(getattr(config, "topology_adapt_every", 0)) > 0:
+            print(
+                "[Trainer] Topology   : "
+                f"every {int(config.topology_adapt_every)} it, "
+                f"split q>={float(config.topology_split_quantile):.2f}, "
+                f"merge q<={float(config.topology_merge_quantile):.2f}, "
+                f"max split={int(config.topology_max_splits)}, "
+                f"max merge={int(config.topology_max_merges)}"
+            )
+        else:
+            print("[Trainer] Topology   : off")
         print(
             f"[Trainer] ImgCache   : cpu={int(config.image_cpu_cache_size)} "
             f"gpu={int(config.image_gpu_cache_size)} prefetch={int(config.image_prefetch_ahead)} "
@@ -968,6 +995,472 @@ class TexturePPISPTrainer(TextureExportMixin):
         edges = torch.as_tensor(pair_edge, dtype=torch.long, device=self.device)
         return pairs, edges
 
+    def _refresh_geometry_regularization_tensors(self):
+        self._edges = self._build_unique_edges(self.faces)
+        self._face_adj_pairs, self._face_adj_edges = self._build_face_adjacency(
+            self.faces, vertex_groups=self._weld_index
+        )
+        self._base_face_pair_d = None
+        self._base_face_pair_weight = None
+        if self._face_adj_pairs is not None and self._face_adj_pairs.shape[0] > 0:
+            base_n, _ = compute_face_normals_and_double_area(self.base_vertices, self.faces)
+            p = self._face_adj_pairs
+            cos_base = (base_n[p[:, 0]] * base_n[p[:, 1]]).sum(dim=1).clamp(-1.0, 1.0)
+            self._base_face_pair_d = (1.0 - cos_base).detach()
+            if bool(self.cfg.geom_normal_tv_use_base_feature_weights):
+                sigma = float(max(1e-6, self.cfg.geom_normal_tv_feature_sigma))
+                self._base_face_pair_weight = torch.exp(-self._base_face_pair_d / sigma).detach()
+
+        if self._weld_enabled and self._weld_index is not None:
+            counts = torch.zeros(
+                self._num_weld_groups,
+                device=self.device,
+                dtype=self.base_vertices.dtype,
+            )
+            ones = torch.ones(
+                self.base_vertices.shape[0],
+                device=self.device,
+                dtype=self.base_vertices.dtype,
+            )
+            counts.index_add_(0, self._weld_index, ones)
+            self._weld_group_inv_counts = (1.0 / counts.clamp(min=1.0)).detach()
+        else:
+            self._weld_group_inv_counts = None
+
+        if self._edges is not None and self._edges.shape[0] > 0:
+            v0 = self.base_vertices[self._edges[:, 0]]
+            v1 = self.base_vertices[self._edges[:, 1]]
+            self._base_edge_lengths = (v0 - v1).norm(dim=1).detach()
+            deg = torch.zeros(self.base_vertices.shape[0], device=self.device, dtype=self.base_vertices.dtype)
+            ones = torch.ones(self._edges.shape[0], device=self.device, dtype=self.base_vertices.dtype)
+            deg.index_add_(0, self._edges[:, 0], ones)
+            deg.index_add_(0, self._edges[:, 1], ones)
+            self._vertex_degree = deg.clamp(min=1.0)
+        else:
+            self._base_edge_lengths = None
+            self._vertex_degree = None
+
+    def _set_topology(self, vertices: torch.Tensor, faces: torch.Tensor, uvs: torch.Tensor):
+        self.base_vertices = vertices.to(self.device)
+        self.faces = faces.to(self.device)
+        self.uvs = uvs.to(self.device)
+
+        self._weld_index = None
+        self._num_weld_groups = int(self.base_vertices.shape[0])
+        self._weld_enabled = False
+        if self.learn_geometry and bool(self.cfg.weld_geometry_vertices):
+            self._weld_index, self._num_weld_groups = self._build_weld_groups(
+                self.base_vertices, self.cfg.weld_position_decimals
+            )
+            self._weld_enabled = self._num_weld_groups < int(self.base_vertices.shape[0])
+
+        geom_shape = ((self._num_weld_groups, 3) if self._weld_enabled
+                      else tuple(self.base_vertices.shape))
+        self.geometry_offsets = nn.Parameter(
+            torch.zeros(geom_shape, device=self.device, dtype=self.base_vertices.dtype),
+            requires_grad=self.learn_geometry,
+        )
+        self._cast_geometry_parameter()
+        self.vertex_offsets = self.geometry_offsets
+        self._refresh_geometry_regularization_tensors()
+
+        self._face_error_ema = torch.zeros(
+            int(self.faces.shape[0]),
+            device=self.device,
+            dtype=self.base_vertices.dtype,
+        )
+        if self.learn_geometry:
+            self.opt_geom = self._create_geom_optimizer()
+
+    def _accumulate_face_error(self, face_ids: torch.Tensor, per_pixel_error: torch.Tensor, mesh_mask: torch.Tensor):
+        if self._face_error_ema is None or self._face_error_ema.numel() == 0:
+            return
+        if face_ids is None:
+            return
+        valid = mesh_mask.bool() & (face_ids >= 0)
+        if not torch.any(valid):
+            return
+
+        ids = face_ids[valid].long()
+        errs = per_pixel_error[valid].to(dtype=self._face_error_ema.dtype)
+        num_faces = int(self.faces.shape[0])
+        face_sum = torch.zeros(num_faces, device=self.device, dtype=self._face_error_ema.dtype)
+        face_cnt = torch.zeros(num_faces, device=self.device, dtype=self._face_error_ema.dtype)
+        face_sum.index_add_(0, ids, errs)
+        face_cnt.index_add_(0, ids, torch.ones_like(errs))
+        seen = face_cnt > 0
+        if not torch.any(seen):
+            return
+        face_mean = face_sum[seen] / face_cnt[seen].clamp(min=1.0)
+        beta = float(min(max(self.cfg.topology_error_beta, 0.0), 0.9999))
+        self._face_error_ema[seen] = beta * self._face_error_ema[seen] + (1.0 - beta) * face_mean
+
+    def _select_topology_face_sets(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_faces = int(self.faces.shape[0])
+        if num_faces <= 0:
+            return torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)
+        e = self._face_error_ema.detach().float()
+        if e.numel() != num_faces or torch.all(e <= 0):
+            return torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)
+
+        split_q = float(min(max(self.cfg.topology_split_quantile, 0.0), 1.0))
+        merge_q = float(min(max(self.cfg.topology_merge_quantile, 0.0), 1.0))
+        split_thr = torch.quantile(e, split_q)
+        merge_thr = torch.quantile(e, merge_q)
+
+        split_idx = torch.nonzero(e >= split_thr, as_tuple=False).squeeze(1)
+        merge_idx = torch.nonzero(e <= merge_thr, as_tuple=False).squeeze(1)
+
+        max_split = max(0, int(self.cfg.topology_max_splits))
+        max_merge = max(0, int(self.cfg.topology_max_merges))
+        if split_idx.numel() > max_split > 0:
+            vals, order = torch.sort(e[split_idx], descending=True)
+            split_idx = split_idx[order[:max_split]]
+        if merge_idx.numel() > max_merge > 0:
+            vals, order = torch.sort(e[merge_idx], descending=False)
+            merge_idx = merge_idx[order[:max_merge]]
+
+        if split_idx.numel() > 0 and merge_idx.numel() > 0:
+            split_set = set(split_idx.detach().cpu().tolist())
+            merge_list = [i for i in merge_idx.detach().cpu().tolist() if i not in split_set]
+            merge_idx = torch.as_tensor(merge_list, dtype=torch.long)
+        return split_idx, merge_idx
+
+    def _remesh_split_merge(self, split_idx: torch.Tensor, merge_idx: torch.Tensor):
+        verts = self.current_vertices().detach().cpu().numpy().astype(np.float32)
+        uvs = self.uvs.detach().cpu().numpy().astype(np.float32)
+        faces = self.faces.detach().cpu().numpy().astype(np.int64)
+
+        split_set = set(split_idx.detach().cpu().tolist()) if split_idx.numel() > 0 else set()
+        merge_set = set(merge_idx.detach().cpu().tolist()) if merge_idx.numel() > 0 else set()
+
+        verts_np = verts.copy()
+        uvs_np = uvs.copy()
+
+        # Build merge candidates in vectorized form from merge-marked faces.
+        if merge_set:
+            merge_ids = np.fromiter(merge_set, dtype=np.int64)
+            merge_ids = merge_ids[(merge_ids >= 0) & (merge_ids < faces.shape[0])]
+        else:
+            merge_ids = np.empty((0,), dtype=np.int64)
+
+        if merge_ids.size > 0:
+            tri_m = faces[merge_ids]  # (M,3)
+            ia, ib, ic = tri_m[:, 0], tri_m[:, 1], tri_m[:, 2]
+            pa, pb, pc = verts[ia], verts[ib], verts[ic]
+            l_ab = np.linalg.norm(pa - pb, axis=1)
+            l_bc = np.linalg.norm(pb - pc, axis=1)
+            l_ca = np.linalg.norm(pc - pa, axis=1)
+            lens = np.stack([l_ab, l_bc, l_ca], axis=1)
+            min_edge = np.argmin(lens, axis=1)
+
+            u = np.where(min_edge == 0, ia, np.where(min_edge == 1, ib, ic)).astype(np.int64)
+            v = np.where(min_edge == 0, ib, np.where(min_edge == 1, ic, ia)).astype(np.int64)
+            w = np.minimum(u, v)
+            z = np.maximum(u, v)
+            min_len = lens[np.arange(lens.shape[0]), min_edge].astype(np.float32)
+            merge_candidates = np.stack([min_len, w.astype(np.float32), z.astype(np.float32)], axis=1)
+        else:
+            merge_candidates = np.empty((0, 3), dtype=np.float32)
+
+        # Split path needs topology updates, keep this loop but avoid set lookups.
+        if split_set:
+            split_mask = np.zeros((faces.shape[0],), dtype=bool)
+            split_ids = np.fromiter(split_set, dtype=np.int64)
+            split_ids = split_ids[(split_ids >= 0) & (split_ids < faces.shape[0])]
+            split_mask[split_ids] = True
+
+            verts_list = [v.copy() for v in verts_np]
+            uvs_list = [u.copy() for u in uvs_np]
+            out_faces = []
+            out_parent = []
+            for fi, tri in enumerate(faces):
+                a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+                if split_mask[fi]:
+                    pm = (verts_np[a] + verts_np[b] + verts_np[c]) / 3.0
+                    um = (uvs_np[a] + uvs_np[b] + uvs_np[c]) / 3.0
+                    m = len(verts_list)
+                    verts_list.append(pm.astype(np.float32, copy=False))
+                    uvs_list.append(um.astype(np.float32, copy=False))
+                    out_faces.append([a, b, m])
+                    out_faces.append([b, c, m])
+                    out_faces.append([c, a, m])
+                    out_parent.extend([fi, fi, fi])
+                else:
+                    out_faces.append([a, b, c])
+                    out_parent.append(fi)
+
+            faces_np = np.asarray(out_faces, dtype=np.int64)
+            parent_idx = np.asarray(out_parent, dtype=np.int64)
+            verts_np = np.asarray(verts_list, dtype=np.float32)
+            uvs_np = np.asarray(uvs_list, dtype=np.float32)
+        else:
+            faces_np = faces.copy()
+            parent_idx = np.arange(faces.shape[0], dtype=np.int64)
+
+        applied_collapses = 0
+        if merge_candidates.shape[0] > 0:
+            # Build welded geometric groups so UV-seam duplicates are treated as one
+            # topological vertex for collapse validity checks.
+            if self._weld_index is not None and int(self._weld_index.numel()) == int(verts_np.shape[0]):
+                vert_to_group = self._weld_index.detach().cpu().numpy().astype(np.int64, copy=False)
+            else:
+                weld_decimals = max(0, int(getattr(self.cfg, "weld_position_decimals", 6)))
+                weld_key = np.round(verts_np, decimals=weld_decimals)
+                _, vert_to_group = np.unique(weld_key, axis=0, return_inverse=True)
+            group_count = int(vert_to_group.max() + 1) if vert_to_group.size > 0 else 0
+            if group_count <= 0:
+                return None
+
+            # Precompute vertex index ranges per welded group for fast remap updates.
+            group_order = np.argsort(vert_to_group, kind="mergesort")
+            groups_sorted = vert_to_group[group_order]
+            group_starts = np.searchsorted(groups_sorted, np.arange(group_count), side="left")
+            group_ends = np.searchsorted(groups_sorted, np.arange(group_count), side="right")
+
+            # Group centroids are reused in collapse midpoint updates.
+            group_sum = np.zeros((group_count, 3), dtype=np.float32)
+            np.add.at(group_sum, vert_to_group, verts_np)
+            group_cnt = np.bincount(vert_to_group, minlength=group_count).astype(np.float32)
+            group_cnt = np.clip(group_cnt, 1.0, None)
+            group_centroid = group_sum / group_cnt[:, None]
+
+            # Build undirected edge incidence on welded groups.
+            faces_g = vert_to_group[faces_np]
+            ge01 = faces_g[:, [0, 1]]
+            ge12 = faces_g[:, [1, 2]]
+            ge20 = faces_g[:, [2, 0]]
+            g_edges = np.concatenate([ge01, ge12, ge20], axis=0)
+            g_edges = np.sort(g_edges, axis=1)
+            uniq_g_edges, g_edge_counts = np.unique(g_edges, axis=0, return_counts=True)
+
+            # Fast incidence lookup by integer edge key + searchsorted.
+            g_count = int(max(1, group_count))
+            g_edge_keys = uniq_g_edges[:, 0].astype(np.int64) * g_count + uniq_g_edges[:, 1].astype(np.int64)
+            g_order = np.argsort(g_edge_keys)
+            g_edge_keys_sorted = g_edge_keys[g_order]
+            g_edge_counts_sorted = g_edge_counts[g_order]
+
+            # Greedy shortest-edge collapse, restricted to group-disjoint interior edges.
+            cand_order = np.argsort(merge_candidates[:, 0])
+            cand_u = merge_candidates[cand_order, 1].astype(np.int64)
+            cand_v = merge_candidates[cand_order, 2].astype(np.int64)
+
+            cand_u_g = vert_to_group[cand_u]
+            cand_v_g = vert_to_group[cand_v]
+            cand_a_g = np.minimum(cand_u_g, cand_v_g)
+            cand_b_g = np.maximum(cand_u_g, cand_v_g)
+            valid_pair = cand_a_g != cand_b_g
+
+            cand_keys = cand_a_g * g_count + cand_b_g
+            pos = np.searchsorted(g_edge_keys_sorted, cand_keys, side="left")
+            in_range = pos < g_edge_keys_sorted.shape[0]
+            present = (
+                valid_pair
+                & in_range
+                & (g_edge_keys_sorted[np.minimum(pos, g_edge_keys_sorted.shape[0] - 1)] == cand_keys)
+            )
+            edge_inc = np.zeros_like(cand_u, dtype=np.int64)
+            edge_inc[present] = g_edge_counts_sorted[pos[present]]
+
+            used_groups = np.zeros((group_count,), dtype=bool)
+            selected_pairs = []
+            for idx in range(cand_u.shape[0]):
+                u = int(cand_u[idx])
+                v = int(cand_v[idx])
+                ug = int(cand_u_g[idx])
+                vg = int(cand_v_g[idx])
+                if u == v:
+                    continue
+                if ug == vg:
+                    continue
+                if used_groups[ug] or used_groups[vg]:
+                    continue
+
+                inc = int(edge_inc[idx])
+                if inc <= 0:
+                    continue
+
+                # Interior-only collapse preserves watertightness on closed meshes.
+                if inc != 2:
+                    continue
+
+                keep_g = ug
+                rem_g = vg
+                selected_pairs.append((u, v, keep_g, rem_g))
+                used_groups[ug] = True
+                used_groups[vg] = True
+
+            if selected_pairs:
+                remap = np.arange(verts_np.shape[0], dtype=np.int64)
+                active = np.ones(verts_np.shape[0], dtype=bool)
+
+                for keep, rem, keep_g, rem_g in selected_pairs:
+                    if not active[keep] or not active[rem]:
+                        continue
+
+                    ks, ke = int(group_starts[keep_g]), int(group_ends[keep_g])
+                    rs, re = int(group_starts[rem_g]), int(group_ends[rem_g])
+                    keep_members = group_order[ks:ke]
+                    rem_members = group_order[rs:re]
+                    if keep_members.size == 0 or rem_members.size == 0:
+                        continue
+
+                    # Move all welded keep-group vertices to midpoint of collapsed pair.
+                    p_mid = 0.5 * (group_centroid[keep_g] + group_centroid[rem_g])
+                    verts_np[keep_members] = p_mid
+
+                    # Merge all rem-group vertices into the keep representative.
+                    remap[rem_members] = keep
+                    active[rem_members] = False
+                    applied_collapses += 1
+
+                faces_np = remap[faces_np]
+
+                old_to_new = -np.ones(verts_np.shape[0], dtype=np.int64)
+                old_to_new[active] = np.arange(int(active.sum()), dtype=np.int64)
+                faces_np = old_to_new[faces_np]
+                verts_np = verts_np[active]
+                uvs_np = uvs_np[active]
+
+        # Re-orient faces to match their source (pre-remesh) face normal direction.
+        if faces_np.shape[0] > 0 and parent_idx.shape[0] == faces_np.shape[0]:
+            tri_new = verts_np[faces_np]  # (F,3,3)
+            n_new = np.cross(tri_new[:, 1] - tri_new[:, 0], tri_new[:, 2] - tri_new[:, 0])
+
+            tri_ref = verts[faces[parent_idx]]  # reference from current pre-remesh mesh
+            n_ref = np.cross(tri_ref[:, 1] - tri_ref[:, 0], tri_ref[:, 2] - tri_ref[:, 0])
+
+            dot = np.einsum("ij,ij->i", n_new, n_ref)
+            flip = dot < 0.0
+            if np.any(flip):
+                tmp = faces_np[flip, 1].copy()
+                faces_np[flip, 1] = faces_np[flip, 2]
+                faces_np[flip, 2] = tmp
+
+        nondeg = (
+            (faces_np[:, 0] != faces_np[:, 1])
+            & (faces_np[:, 1] != faces_np[:, 2])
+            & (faces_np[:, 2] != faces_np[:, 0])
+        )
+        faces_np = faces_np[nondeg]
+        parent_idx = parent_idx[nondeg]
+        if faces_np.shape[0] == 0:
+            return None
+
+        # Remove duplicate triangles (same vertex set).
+        key = np.sort(faces_np, axis=1)
+        _, keep_idx = np.unique(key, axis=0, return_index=True)
+        keep_idx = np.sort(keep_idx)
+        faces_np = faces_np[keep_idx]
+        parent_idx = parent_idx[keep_idx]
+
+        return (
+            torch.from_numpy(verts_np),
+            torch.from_numpy(faces_np.astype(np.int64)),
+            torch.from_numpy(uvs_np),
+            int(len(split_set)),
+            int(applied_collapses),
+        )
+
+    def _maybe_adapt_topology(self):
+        every = int(getattr(self.cfg, "topology_adapt_every", 0) or 0)
+        if every <= 0:
+            return
+        if (self.iter + 1) % every != 0:
+            return
+
+        def _skip(reason: str):
+            print(f"[Topology] skip iter={self.iter+1}: {reason}")
+
+        start_iter = self.cfg.topology_start_iter
+        if start_iter is None:
+            start_iter = max(int(self.cfg.warmup_iters), int(self.cfg.geometry_warmup_iters))
+        if self.iter < int(start_iter):
+            _skip(f"before start_iter ({self.iter} < {int(start_iter)})")
+            return
+
+        min_faces = max(4, int(getattr(self.cfg, "topology_min_faces", 4)))
+        cur_faces = int(self.faces.shape[0])
+
+        split_idx, merge_idx = self._select_topology_face_sets()
+        raw_split = int(split_idx.numel())
+        raw_merge = int(merge_idx.numel())
+
+        top_max_faces = int(getattr(self.cfg, "topology_max_faces", 0) or 0)
+        collapse_only_mode = False
+        split_only_mode = False
+
+        # If we are above max, only allow collapsing.
+        if top_max_faces > 0 and cur_faces > top_max_faces:
+            split_idx = torch.empty(0, dtype=torch.long)
+            collapse_only_mode = True
+            print(
+                f"[Topology] iter={self.iter+1}: face_count {cur_faces:,} > max {top_max_faces:,}, "
+                "collapse-only mode"
+            )
+
+        # If we are below min, only allow splitting.
+        if cur_faces < min_faces:
+            merge_idx = torch.empty(0, dtype=torch.long)
+            split_only_mode = True
+            print(
+                f"[Topology] iter={self.iter+1}: face_count {cur_faces:,} < min {min_faces:,}, "
+                "split-only mode"
+            )
+
+        if split_idx.numel() == 0 and merge_idx.numel() == 0:
+            _skip(
+                f"no candidates after constraints (raw split={raw_split}, raw merge={raw_merge})"
+            )
+            return
+
+        remesh = self._remesh_split_merge(split_idx, merge_idx)
+        if remesh is None:
+            _skip("remesh returned None (all faces became degenerate/invalid)")
+            return
+        verts_new, faces_new, uvs_new, n_split, n_merge_edges = remesh
+        new_faces = int(faces_new.shape[0])
+
+        # When forced into one-sided adaptation, accept directional improvement
+        # even if we are still outside the target range.
+        if collapse_only_mode:
+            if new_faces >= cur_faces:
+                _skip(
+                    f"collapse-only made no progress (faces {cur_faces:,} -> {new_faces:,})"
+                )
+                return
+        elif split_only_mode:
+            if new_faces <= cur_faces:
+                _skip(
+                    f"split-only made no progress (faces {cur_faces:,} -> {new_faces:,})"
+                )
+                return
+        else:
+            if new_faces < min_faces:
+                _skip(
+                    f"candidate topology dropped below min_faces "
+                    f"({new_faces:,} < {min_faces:,})"
+                )
+                return
+            if top_max_faces > 0 and new_faces > top_max_faces:
+                _skip(
+                    f"candidate topology exceeded max_faces "
+                    f"({new_faces:,} > {top_max_faces:,})"
+                )
+                return
+
+        old_v = int(self.base_vertices.shape[0])
+        old_f = int(self.faces.shape[0])
+        self._set_topology(verts_new, faces_new, uvs_new)
+        self._topology_events += 1
+        print(
+            f"[Topology] event#{self._topology_events} iter={self.iter+1} "
+            f"verts {old_v:,}->{int(self.base_vertices.shape[0]):,}, "
+            f"faces {old_f:,}->{int(self.faces.shape[0]):,} "
+            f"(split={n_split}, collapse_edges={n_merge_edges})"
+        )
+
     def current_vertices(self) -> torch.Tensor:
         if not self.learn_geometry:
             return self.base_vertices
@@ -982,7 +1475,7 @@ class TexturePPISPTrainer(TextureExportMixin):
     # Render
     # ------------------------------------------------------------------
 
-    def render_view(self, view: CameraView, return_mask: bool = False):
+    def render_view(self, view: CameraView, return_mask: bool = False, return_face_ids: bool = False):
         """Full differentiable render → LDR (H, W, 3) in [0,1]."""
         ci = view.cam_idx
         R  = self._cam_R[ci]
@@ -998,14 +1491,24 @@ class TexturePPISPTrainer(TextureExportMixin):
                 gy, gx = torch.meshgrid(ys, xs, indexing="ij")
                 self.ppisp.r2 = gx**2 + gy**2
 
-        hdr, mask = self.rasterizer.render_with_mask(
-            self.current_vertices(), self.faces, self.uvs,
-            self.texture, R, t, K, W, H,
-        )
+        if return_face_ids:
+            hdr, mask, face_ids = self.rasterizer.render_with_mask_and_face_ids(
+                self.current_vertices(), self.faces, self.uvs,
+                self.texture, R, t, K, W, H,
+            )
+        else:
+            hdr, mask = self.rasterizer.render_with_mask(
+                self.current_vertices(), self.faces, self.uvs,
+                self.texture, R, t, K, W, H,
+            )
         ldr = self.ppisp(hdr, ci)
         pred = ldr * mask
         if return_mask:
+            if return_face_ids:
+                return pred, (mask[..., 0] > 0.5), face_ids
             return pred, (mask[..., 0] > 0.5)
+        if return_face_ids:
+            return pred, face_ids
         return pred
 
     # ------------------------------------------------------------------
@@ -1055,7 +1558,9 @@ class TexturePPISPTrainer(TextureExportMixin):
             self.opt_geom.zero_grad(set_to_none=True)
 
         with self._autocast_ctx():
-            pred, mesh_mask = self.render_view(view, return_mask=True)
+            pred, mesh_mask, face_ids = self.render_view(
+                view, return_mask=True, return_face_ids=True
+            )
 
         # Keep render in AMP, but evaluate objective in fp32 for stability.
         if self._amp_enabled and self.cfg.amp_loss_fp32:
@@ -1064,6 +1569,9 @@ class TexturePPISPTrainer(TextureExportMixin):
         else:
             pred_loss = pred
             gt_loss = gt
+
+        per_pixel_error = (pred_loss - gt_loss).abs().mean(dim=-1).detach()
+        self._accumulate_face_error(face_ids, per_pixel_error, mesh_mask)
 
         vertices_now = self.current_vertices() if train_geom else None
         losses = self.loss_fn(
@@ -1187,6 +1695,7 @@ class TexturePPISPTrainer(TextureExportMixin):
                 gt = self._image_cache.get(vidx)
                 losses = self.step(view, gt_image=gt)
                 self._update_lr()
+                self._maybe_adapt_topology()
                 self._poll_live_view_events()
                 self._update_live_view(losses)
 
@@ -1244,6 +1753,9 @@ class TexturePPISPTrainer(TextureExportMixin):
         path = os.path.join(self.cfg.output_dir, f"checkpoint_{iteration:06d}.pt")
         torch.save({
             "iteration":  iteration,
+            "mesh_vertices": self.base_vertices.detach().cpu(),
+            "mesh_faces": self.faces.detach().cpu(),
+            "mesh_uvs": self.uvs.detach().cpu(),
             "texture":    self.texture.state_dict(),
             "ppisp":      self.ppisp.state_dict(),
             "opt_tex":    self.opt_tex.state_dict(),
@@ -1257,6 +1769,8 @@ class TexturePPISPTrainer(TextureExportMixin):
             "amp_enabled": self._amp_enabled,
             "amp_dtype": self.cfg.amp_dtype,
             "grad_scaler": self._grad_scaler.state_dict() if self._grad_scaler is not None else None,
+            "face_error_ema": self._face_error_ema.detach().cpu() if self._face_error_ema is not None else None,
+            "topology_events": int(self._topology_events),
             "loss_log":   self.loss_log,
         }, path)
         # Keep only the most recent checkpoint file to limit disk usage.
@@ -1277,6 +1791,12 @@ class TexturePPISPTrainer(TextureExportMixin):
 
     def load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
+
+        mesh_v = ckpt.get("mesh_vertices")
+        mesh_f = ckpt.get("mesh_faces")
+        mesh_uv = ckpt.get("mesh_uvs")
+        if mesh_v is not None and mesh_f is not None and mesh_uv is not None:
+            self._set_topology(mesh_v.to(self.device), mesh_f.to(self.device), mesh_uv.to(self.device))
 
         tex_blob = ckpt["texture"].get("tex", None)
         if tex_blob is not None:
@@ -1320,6 +1840,12 @@ class TexturePPISPTrainer(TextureExportMixin):
                         print("[Trainer] WARNING: geometry offset shape mismatch in checkpoint; keeping current geometry offsets")
             if self.opt_geom is not None and ckpt.get("opt_geom") is not None:
                 self.opt_geom.load_state_dict(ckpt["opt_geom"])
+        fe = ckpt.get("face_error_ema")
+        if fe is not None:
+            fe = fe.to(self.device)
+            if fe.shape[0] == self.faces.shape[0]:
+                self._face_error_ema = fe.to(dtype=self.base_vertices.dtype)
+        self._topology_events = int(ckpt.get("topology_events", 0))
         if self._grad_scaler is not None and ckpt.get("grad_scaler") is not None:
             self._grad_scaler.load_state_dict(ckpt["grad_scaler"])
         self.iter     = ckpt["iteration"]

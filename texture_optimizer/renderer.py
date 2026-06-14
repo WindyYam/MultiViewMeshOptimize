@@ -134,7 +134,8 @@ class NvdiffrastRasterizer:
                texture:  TextureMap,
                R: torch.Tensor, t: torch.Tensor, K: torch.Tensor,
              W: int, H: int,
-             return_mask: bool = False):
+                         return_mask: bool = False,
+                         return_face_ids: bool = False):
         """Returns (H, W, 3) float32. Fully differentiable."""
         dr = self.dr
 
@@ -178,10 +179,17 @@ class NvdiffrastRasterizer:
         # 5) Antialias edges
         color = dr.antialias(color, rast, verts_clip, faces_i32) # (1,H,W,3)
         color = color.squeeze(0)                                   # (H,W,3)
-        if not return_mask:
+        if not return_mask and not return_face_ids:
             return color
 
         mask = (rast[..., 3:4] > 0).float().squeeze(0)            # (H,W,1)
+        if return_face_ids:
+            # nvdiffrast stores tri_id+1 in rast[...,3], 0 means background.
+            face_ids = rast[..., 3].to(torch.long).squeeze(0) - 1
+            face_ids = torch.where(mask[..., 0] > 0.5, face_ids, torch.full_like(face_ids, -1))
+            if return_mask:
+                return color, mask, face_ids
+            return color, face_ids
         return color, mask
 
 
@@ -206,3 +214,9 @@ class Rasterizer:
         return self._nvdr.render(vertices, faces,
                                  uvs, texture, R, t, K, W, H,
                                  return_mask=True)
+
+    def render_with_mask_and_face_ids(self, vertices, faces, uvs, texture, R, t, K, W, H):
+        return self._nvdr.render(vertices, faces,
+                                 uvs, texture, R, t, K, W, H,
+                                 return_mask=True,
+                                 return_face_ids=True)
