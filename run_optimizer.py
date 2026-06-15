@@ -33,7 +33,7 @@ def parse_args():
     p.add_argument("--tex_res",     type=int,   default=8192,
                    help="Target output texture long side (aspect ratio preserved from input texture when available)")
     p.add_argument("--uv_unwrap", action="store_true",
-                   help="Run Open3D xatlas UV unwrap on input mesh before training")
+                   help="Run xatlas UV unwrap on input mesh before training")
     p.add_argument("--tex_dtype", type=str, default="auto", choices=["auto", "fp32", "fp16", "bf16"],
                    help="Texture parameter dtype (auto follows AMP on CUDA; lowers VRAM when fp16/bf16)")
     p.add_argument("--tex_optimizer", type=str, default="adam", choices=["adam", "sgd"],
@@ -50,7 +50,7 @@ def parse_args():
                    help="Use progressive texture upscaling during training (1/2 -> full)")
     p.add_argument("--lr_tex",      type=float, default=1e-3,
                    help="Texture learning rate")
-    p.add_argument("--lr_ppisp",    type=float, default=3e-3,
+    p.add_argument("--lr_ppisp",    type=float, default=2e-3,
                    help="PPISP learning rate")
     p.add_argument("--lr_decay_start", type=int, default=None,
                    help="Iteration to start LR decay (default: auto at ~75%% of total iters)")
@@ -191,7 +191,7 @@ def main():
         image_scale=args.scale,
         max_cameras=args.max_cameras,
         mesh_path=args.mesh,
-        uv_unwrap_mode=("open3d_xatlas" if args.uv_unwrap else "none"),
+        uv_unwrap_mode=("xatlas" if args.uv_unwrap else "none"),
         uv_unwrap_size=args.tex_res,
         device=str(device),
     )

@@ -630,7 +630,8 @@ def _bake_vertex_colors_to_texture(
     # Vectorized splat of all face-vertex colors into UV texel bins.
     uv_px = uvs.clone()
     uv_px[:, 0] = uv_px[:, 0] * (res - 1)
-    uv_px[:, 1] = (1.0 - uv_px[:, 1]) * (res - 1)  # flip V
+    # Internal UVs use image-space convention (V=0 at top), so map directly.
+    uv_px[:, 1] = uv_px[:, 1] * (res - 1)
 
     face_vidx = faces.reshape(-1).long()
     px = uv_px[face_vidx, 0].round().clamp(0, res - 1).to(torch.int64)
@@ -649,15 +650,24 @@ def _bake_vertex_colors_to_texture(
     tex = torch.from_numpy(tex_flat.reshape(res, res, 3))
     weight = torch.from_numpy(weight_flat.reshape(res, res))
     mask = weight > 0
-    # Fill zero-weight texels with nearest non-zero (simple dilation)
-    from PIL import Image as PILImage
-    t_np = (tex.numpy() * 255).astype(np.uint8)
-    # Two passes of median-ish fill via PIL resize trick
-    small = PILImage.fromarray(t_np).resize((res//4, res//4), PILImage.BILINEAR)
-    filled = small.resize((res, res), PILImage.BILINEAR)
-    # Blend: keep original where we have data, fill elsewhere
-    base = torch.from_numpy(np.array(filled).astype(np.float32) / 255.0)
-    tex = torch.where(mask.unsqueeze(-1), tex, base)
+
+    # Fill uncovered texels from nearest covered texel to avoid large black regions.
+    if torch.any(mask):
+        mask_np = mask.cpu().numpy().astype(bool, copy=False)
+        tex_np = tex.cpu().numpy().astype(np.float32, copy=False)
+        try:
+            from scipy import ndimage
+            _, (iy, ix) = ndimage.distance_transform_edt(~mask_np, return_indices=True)
+            nearest = tex_np[iy, ix]
+            base = torch.from_numpy(nearest.astype(np.float32, copy=False))
+        except Exception:
+            # Fallback if scipy is unavailable.
+            from PIL import Image as PILImage
+            t_np = (tex_np * 255).astype(np.uint8)
+            small = PILImage.fromarray(t_np).resize((max(1, res // 4), max(1, res // 4)), PILImage.BILINEAR)
+            filled = small.resize((res, res), PILImage.BILINEAR)
+            base = torch.from_numpy(np.array(filled).astype(np.float32) / 255.0)
+        tex = torch.where(mask.unsqueeze(-1), tex, base)
     return tex.clamp(0, 1)
 
 
@@ -795,7 +805,7 @@ def _sample_texture_at_uvs(tex_image: torch.Tensor, uvs: torch.Tensor) -> torch.
 
     tex = tex_image.permute(2, 0, 1).unsqueeze(0).float()  # (1,3,H,W)
     grid = uvs.float() * 2.0 - 1.0
-    grid[:, 1] = -grid[:, 1]
+    # Internal UVs are top-origin, matching grid_sample image coordinates.
     grid = grid.view(1, 1, -1, 2)  # (1,1,V,2)
     sampled = F.grid_sample(
         tex,
@@ -807,9 +817,9 @@ def _sample_texture_at_uvs(tex_image: torch.Tensor, uvs: torch.Tensor) -> torch.
     return sampled.squeeze(0).squeeze(1).T.clamp(0.0, 1.0).contiguous()  # (V,3)
 
 
-def _unwrap_mesh_open3d_xatlas(mesh: MeshData, atlas_size: int) -> MeshData:
+def _unwrap_mesh_xatlas(mesh: MeshData, atlas_size: int) -> MeshData:
     """
-    Re-unwrap mesh UVs with Open3D xatlas and initialize atlas from colors
+    Re-unwrap mesh UVs with xatlas and initialize atlas from colors
     sampled on the previous texture.
     """
     if mesh.faces.shape[0] == 0:
@@ -818,58 +828,43 @@ def _unwrap_mesh_open3d_xatlas(mesh: MeshData, atlas_size: int) -> MeshData:
         raise ValueError("Cannot unwrap with texture transfer: input mesh has no texture")
 
     try:
-        import open3d as o3d
+        import xatlas
     except Exception as exc:
         raise RuntimeError(
-            "open3d is required for xatlas unwrap mode. Install it with: pip install open3d"
+            "xatlas is required for xatlas unwrap mode. Install it with: pip install xatlas"
         ) from exc
 
     atlas_size = int(max(32, atlas_size))
-    print(f"[ColmapScene] Re-unwrapping input mesh with Open3D xatlas (size={atlas_size})")
+    print(f"[ColmapScene] Re-unwrapping input mesh with xatlas (size={atlas_size})")
 
     sampled_colors = _sample_texture_at_uvs(mesh.tex_image, mesh.uvs)
 
-    verts_np = mesh.vertices.detach().cpu().numpy().astype(np.float64, copy=False)
+    verts_np = mesh.vertices.detach().cpu().numpy().astype(np.float32, copy=False)
     faces_np = mesh.faces.detach().cpu().numpy().astype(np.int32, copy=False)
-    colors_np = sampled_colors.detach().cpu().numpy().astype(np.float64, copy=False)
+    colors_np = sampled_colors.detach().cpu().numpy().astype(np.float32, copy=False)
 
-    mesh_legacy = o3d.geometry.TriangleMesh()
-    mesh_legacy.vertices = o3d.utility.Vector3dVector(verts_np)
-    mesh_legacy.triangles = o3d.utility.Vector3iVector(faces_np)
-    mesh_legacy.vertex_colors = o3d.utility.Vector3dVector(colors_np)
+    # xatlas returns a vertex remap, reindexed face indices, and per-vertex UVs.
+    vmapping, face_indices, uvs = xatlas.parametrize(verts_np, faces_np)
 
-    tmesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh_legacy)
-    if not hasattr(tmesh, "compute_uvatlas"):
-        raise RuntimeError(
-            "This Open3D build does not expose compute_uvatlas(). "
-            "Please upgrade Open3D to a version with UVAtlas support."
-        )
+    vmapping = np.asarray(vmapping, dtype=np.int64)
+    face_indices = np.asarray(face_indices, dtype=np.int64)
+    uvs = np.asarray(uvs, dtype=np.float32)
 
-    tmesh.compute_uvatlas(size=atlas_size)
-    mesh_uv = tmesh.to_legacy()
-    if not mesh_uv.has_triangle_uvs():
-        raise RuntimeError("Open3D UVAtlas unwrap failed: no triangle UVs generated")
+    if face_indices.ndim != 2 or face_indices.shape[1] != 3:
+        raise RuntimeError("xatlas unwrap output is inconsistent: face index shape is not (F,3)")
+    if vmapping.shape[0] != uvs.shape[0]:
+        raise RuntimeError("xatlas unwrap output is inconsistent: vmapping/uv size mismatch")
 
-    tri_uvs_np = np.asarray(mesh_uv.triangle_uvs, dtype=np.float32)
-    verts_uv_np = np.asarray(mesh_uv.vertices, dtype=np.float32)
-    faces_uv_np = np.asarray(mesh_uv.triangles, dtype=np.int64)
-    colors_uv_np = np.asarray(mesh_uv.vertex_colors, dtype=np.float32)
-
-    if tri_uvs_np.shape[0] != faces_uv_np.shape[0] * 3:
-        raise RuntimeError("UV unwrap output is inconsistent: triangle_uvs size mismatch")
-
-    tri_v = faces_uv_np.reshape(-1)
-    new_verts_np = verts_uv_np[tri_v]
-    new_cols_np = colors_uv_np[tri_v]
-    new_uvs_np = tri_uvs_np.reshape(-1, 2).copy()
+    new_verts_np = verts_np[vmapping]
+    new_cols_np = colors_np[vmapping]
+    new_uvs_np = uvs.copy()
     # Keep internal convention aligned with existing loaders.
     new_uvs_np[:, 1] = 1.0 - new_uvs_np[:, 1]
 
     new_verts_t = torch.from_numpy(new_verts_np.astype(np.float32, copy=False))
     new_uvs_t = torch.from_numpy(new_uvs_np.astype(np.float32, copy=False))
     new_cols_t = torch.from_numpy(new_cols_np.astype(np.float32, copy=False))
-    num_faces = int(faces_uv_np.shape[0])
-    new_faces_t = torch.arange(num_faces * 3, dtype=torch.int64).reshape(num_faces, 3)
+    new_faces_t = torch.from_numpy(face_indices.astype(np.int64, copy=False))
 
     tex_image = _bake_vertex_colors_to_texture(
         verts=new_verts_t,
@@ -996,11 +991,11 @@ class ColmapScene:
         # --- Load mesh ---
         self.mesh = _find_and_load_mesh(self.root, mesh_path)
         unwrap_mode = str(uv_unwrap_mode or "none").lower()
-        if unwrap_mode in ("open3d_xatlas", "xatlas"):
+        if unwrap_mode in ("xatlas", "open3d_xatlas"):
             unwrap_size = int(uv_unwrap_size)
             if unwrap_size <= 0:
                 raise ValueError("uv_unwrap_size must be > 0 when uv_unwrap_mode is enabled")
-            self.mesh = _unwrap_mesh_open3d_xatlas(self.mesh, atlas_size=unwrap_size)
+            self.mesh = _unwrap_mesh_xatlas(self.mesh, atlas_size=unwrap_size)
         elif unwrap_mode != "none":
             raise ValueError(f"Unknown uv_unwrap_mode='{uv_unwrap_mode}'")
 
