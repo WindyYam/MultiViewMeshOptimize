@@ -7,7 +7,6 @@ exposure inconsistencies in COLMAP-reconstructed textured meshes.
 
 Usage:
   python run_optimizer.py --scene /path/to/dense --mesh /path/to/mesh.ply
-  python run_optimizer.py --synthetic --iters 300
   python run_optimizer.py --scene /path/to/dense --mesh mesh.obj --resume outputs/checkpoint_005000.pt
 """
 
@@ -25,8 +24,6 @@ def parse_args():
                    help="Path to COLMAP scene root (contains sparse/ and images/)")
     p.add_argument("--mesh",        type=str,   default=None,
                    help="Path to .ply or .obj mesh (auto-detected if omitted)")
-    p.add_argument("--synthetic",   action="store_true",
-                   help="Run on a synthetic test scene (no real data needed)")
     p.add_argument("--output",      type=str,   default="outputs",
                    help="Output directory for texture, PPISP params, checkpoints")
     p.add_argument("--iters",       type=int,   default=5000,
@@ -175,84 +172,9 @@ def main():
 
     from texture_optimizer.trainer import TrainConfig, TexturePPISPTrainer
 
-    # ------------------------------------------------------------------ synthetic
-    if args.synthetic:
-        print("\n[Demo] Running synthetic test scene ...\n")
-        from texture_optimizer.dataset import make_synthetic_scene
-        scene = make_synthetic_scene(num_cameras=12, W=128, H=96,
-                                     device=str(device))
-        cfg = TrainConfig()
-        cfg.num_iterations  = args.iters
-        cfg.output_dir      = args.output
-        cfg.tex_H = cfg.tex_W = 256
-        cfg.warmup_iters    = min(50, args.iters // 10)
-        cfg.tex_update_every = max(1, args.tex_update_every)
-        cfg.lr_texture      = args.lr_tex
-        cfg.lr_ppisp        = args.lr_ppisp
-        cfg.lr_decay_start  = args.lr_decay_start
-        cfg.lr_decay_iters  = args.lr_decay_iters
-        cfg.lr_decay_factor = args.lr_decay_factor
-        cfg.progressive_texture = args.progressive_tex
-        cfg.texture_dtype   = args.tex_dtype
-        cfg.tex_optimizer   = args.tex_optimizer
-        cfg.l1_weight       = args.l1_weight
-        cfg.ssim_weight     = args.ssim_weight
-        cfg.ssim_backend    = args.ssim_backend
-        cfg.lr_geometry     = args.lr_geom
-        cfg.learn_vignette  = not args.no_vignette
-        cfg.ppisp_gamma     = args.ppisp_gamma
-        cfg.learn_gamma     = args.learn_gamma
-        cfg.learn_geometry  = args.learn_geometry
-        cfg.geometry_warmup_iters = args.geom_warmup
-        cfg.geom_update_every = max(1, args.geom_update_every)
-        cfg.geometry_dtype  = args.geom_dtype
-        cfg.geom_optimizer  = args.geom_optimizer
-        cfg.geom_normal_tv_weight = args.geom_tv_weight
-        cfg.geom_edge_uniform_weight = args.geom_edge_uniform_weight
-        cfg.geom_edge_uniform_eps = args.geom_edge_uniform_eps
-        cfg.max_vertex_offset     = (args.max_vertex_offset
-                         if args.max_vertex_offset > 0 else None)
-        cfg.weld_geometry_vertices = not args.no_weld_geometry
-        cfg.live_view       = args.live_view
-        cfg.live_view_every = args.live_view_every
-        cfg.live_view_camera = args.live_view_cam
-        cfg.live_view_max_size = args.live_view_max_size
-        cfg.use_amp         = args.amp
-        cfg.amp_dtype       = args.amp_dtype
-        cfg.amp_loss_fp32   = not args.no_amp_loss_fp32
-        cfg.amp_init_scale  = args.amp_init_scale
-        cfg.amp_growth_interval = args.amp_growth_interval
-        cfg.use_tf32        = not args.no_tf32
-        cfg.image_cpu_cache_size = args.image_cpu_cache_size
-        cfg.image_gpu_cache_size = args.image_gpu_cache_size
-        cfg.image_prefetch_ahead = args.image_prefetch_ahead
-        cfg.image_loader_workers = args.image_loader_workers
-        cfg.image_fs_cache       = not args.no_image_fs_cache
-        cfg.image_cache_dir      = args.image_cache_dir
-        cfg.tex_seam_pad_px = max(0, int(args.tex_seam_pad))
-        cfg.alter_every = max(0, int(args.alter_every))
-        cfg.topology_adapt_every = max(0, int(args.topology_adapt_every))
-        cfg.topology_error_beta = float(args.topology_error_beta)
-        cfg.topology_split_quantile = float(args.topology_split_quantile)
-        cfg.topology_merge_quantile = float(args.topology_merge_quantile)
-        cfg.topology_max_splits = max(0, int(args.topology_max_splits))
-        cfg.topology_max_merges = max(0, int(args.topology_max_merges))
-        cfg.topology_start_iter = args.topology_start_iter
-        cfg.topology_min_faces = max(4, int(args.topology_min_faces))
-        cfg.topology_max_faces = max(0, int(args.topology_max_faces))
-        cfg.device          = str(device)
-        cfg.log_every       = max(1, args.iters // 30)
-        cfg.save_every      = max(1, args.iters // 5)
-        trainer = TexturePPISPTrainer(scene, cfg)
-        if args.resume:
-            trainer.load_checkpoint(args.resume)
-        trainer.train()
-        trainer.export_results()
-        return
-
     # ------------------------------------------------------------------ real scene
     if args.scene is None:
-        print("ERROR: provide --scene or --synthetic")
+        print("ERROR: provide --scene")
         sys.exit(1)
 
     from texture_optimizer.dataset import ColmapScene

@@ -456,6 +456,7 @@ class TexturePPISPTrainer(TextureExportMixin):
 
         self.iter     = 0
         self.loss_log: List[dict] = []
+        self.loss_log_interval: List[dict] = []
 
         self._cv2 = None
         self._live_view_enabled = False
@@ -1713,6 +1714,11 @@ class TexturePPISPTrainer(TextureExportMixin):
                     else:
                         mode = "joint"
                     avg      = {k: v / cfg.log_every for k, v in running.items()}
+                    self.loss_log_interval.append({
+                        "iter": self.iter + 1,
+                        "photo": float(avg["photo"]),
+                        "total": float(avg["total"]),
+                    })
                     w_photo = cfg.photo_weight * avg["photo"]
                     w_ppisp_reg = cfg.ppisp_reg_weight * avg["ppisp_reg"]
                     w_normal_tv = (float(cfg.geom_normal_tv_weight) * avg["geom_normal_tv"]
@@ -1739,6 +1745,7 @@ class TexturePPISPTrainer(TextureExportMixin):
                 if (self.iter + 1) % cfg.save_every == 0:
                     self._save_checkpoint(self.iter + 1)
 
+            self._save_loss_plot()
             print(f"\n[Trainer] ✓  Done in {(time.time()-t0)/60:.1f} min")
             self.ppisp.print_summary()
         finally:
@@ -1748,6 +1755,49 @@ class TexturePPISPTrainer(TextureExportMixin):
     # ------------------------------------------------------------------
     # Checkpoint / export
     # ------------------------------------------------------------------
+
+    def _save_loss_plot(self):
+        points = list(self.loss_log_interval)
+        if not points:
+            step = max(1, int(self.cfg.log_every))
+            points = [
+                {
+                    "iter": int(row.get("iter", i + 1)) + 1,
+                    "photo": float(row.get("photo", 0.0)),
+                    "total": float(row.get("total", 0.0)),
+                }
+                for i, row in enumerate(self.loss_log)
+                if (i + 1) % step == 0
+            ]
+        if not points:
+            print("[Trainer] LossPlot  : skipped (no interval loss samples)")
+            return
+
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as e:
+            print(f"[Trainer] LossPlot  : skipped (matplotlib unavailable: {e})")
+            return
+
+        out_path = os.path.join(self.cfg.output_dir, "loss_curve.png")
+        iters = [int(p["iter"]) for p in points]
+        photo = [float(p["photo"]) for p in points]
+        total = [float(p["total"]) for p in points]
+
+        plt.figure(figsize=(9.5, 5.0))
+        plt.plot(iters, photo, linewidth=1.8, label="Photometric Loss")
+        plt.plot(iters, total, linewidth=1.8, label="Total Loss")
+        plt.xlabel(f"Iteration (every {max(1, int(self.cfg.log_every))} iters)")
+        plt.ylabel("Loss")
+        plt.title("Training Loss Curves")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=160)
+        plt.close()
+        print(f"[Trainer] LossPlot  : {out_path}")
 
     def _save_checkpoint(self, iteration: int):
         path = os.path.join(self.cfg.output_dir, f"checkpoint_{iteration:06d}.pt")
@@ -1772,6 +1822,7 @@ class TexturePPISPTrainer(TextureExportMixin):
             "face_error_ema": self._face_error_ema.detach().cpu() if self._face_error_ema is not None else None,
             "topology_events": int(self._topology_events),
             "loss_log":   self.loss_log,
+            "loss_log_interval": self.loss_log_interval,
         }, path)
         # Keep only the most recent checkpoint file to limit disk usage.
         self._prune_old_checkpoints(path)
@@ -1850,6 +1901,7 @@ class TexturePPISPTrainer(TextureExportMixin):
             self._grad_scaler.load_state_dict(ckpt["grad_scaler"])
         self.iter     = ckpt["iteration"]
         self.loss_log = ckpt.get("loss_log", [])
+        self.loss_log_interval = ckpt.get("loss_log_interval", [])
         print(f"[Trainer] Loaded checkpoint iter {self.iter}: {path}")
 
 
