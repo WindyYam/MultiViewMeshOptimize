@@ -133,7 +133,8 @@ class NvdiffrastRasterizer:
                uvs:      torch.Tensor,  # (V,2) [0,1]
                texture:  TextureMap,
                R: torch.Tensor, t: torch.Tensor, K: torch.Tensor,
-             W: int, H: int,
+                         W: int, H: int,
+                                                 texture_tensor: Optional[torch.Tensor] = None,
                          return_mask: bool = False,
                          return_face_ids: bool = False):
         """Returns (H, W, 3) float32. Fully differentiable."""
@@ -157,7 +158,8 @@ class NvdiffrastRasterizer:
                                        diff_attrs="all")          # (1,H,W,2)
 
         # 4) Sample texture. Keep atlas dtype when possible to reduce VRAM.
-        tex_hwc = texture.tex.permute(0, 2, 3, 1).contiguous()
+        tex_src = texture_tensor if texture_tensor is not None else texture.tex
+        tex_hwc = tex_src.permute(0, 2, 3, 1).contiguous()
         texc_c  = texc.to(dtype=tex_hwc.dtype).contiguous()
         texc_db_c = texc_db.to(dtype=tex_hwc.dtype).contiguous()
         try:
@@ -206,17 +208,20 @@ class Rasterizer:
             )
         self.uses_nvdiffrast = True
 
-    def render(self, vertices, faces, uvs, texture, R, t, K, W, H) -> torch.Tensor:
-        return self._nvdr.render(vertices, faces,
-                                 uvs, texture, R, t, K, W, H)
-
-    def render_with_mask(self, vertices, faces, uvs, texture, R, t, K, W, H):
+    def render(self, vertices, faces, uvs, texture, R, t, K, W, H, texture_tensor=None) -> torch.Tensor:
         return self._nvdr.render(vertices, faces,
                                  uvs, texture, R, t, K, W, H,
+                                 texture_tensor=texture_tensor)
+
+    def render_with_mask(self, vertices, faces, uvs, texture, R, t, K, W, H, texture_tensor=None):
+        return self._nvdr.render(vertices, faces,
+                                 uvs, texture, R, t, K, W, H,
+                                 texture_tensor=texture_tensor,
                                  return_mask=True)
 
-    def render_with_mask_and_face_ids(self, vertices, faces, uvs, texture, R, t, K, W, H):
+    def render_with_mask_and_face_ids(self, vertices, faces, uvs, texture, R, t, K, W, H, texture_tensor=None):
         return self._nvdr.render(vertices, faces,
                                  uvs, texture, R, t, K, W, H,
+                                 texture_tensor=texture_tensor,
                                  return_mask=True,
                                  return_face_ids=True)

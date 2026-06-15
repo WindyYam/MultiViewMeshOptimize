@@ -38,6 +38,14 @@ def parse_args():
                    help="Texture parameter dtype (auto follows AMP on CUDA; lowers VRAM when fp16/bf16)")
     p.add_argument("--tex_optimizer", type=str, default="adam", choices=["adam", "sgd"],
                    help="Texture optimizer (sgd reduces VRAM vs adam)")
+    p.add_argument("--tex_tile_update", action="store_true",
+                   help="Enable tile-wise texture updates (updates one texture tile per iteration to reduce optimizer/grad memory)")
+    p.add_argument("--tex_tile_size", type=int, default=8192,
+                   help="Texture tile size in pixels for --tex_tile_update")
+    p.add_argument("--tex_tile_stride", type=int, default=0,
+                   help="Texture tile stride in pixels for --tex_tile_update (0 uses tile size)")
+    p.add_argument("--tex_tile_sequential", action="store_true",
+                   help="Use sequential tile order (default is random tile sampling)")
     p.add_argument("--progressive_tex", action="store_true",
                    help="Use progressive texture upscaling during training (1/2 -> full)")
     p.add_argument("--lr_tex",      type=float, default=1e-3,
@@ -212,6 +220,10 @@ def main():
     cfg.progressive_texture = args.progressive_tex
     cfg.texture_dtype   = args.tex_dtype
     cfg.tex_optimizer   = args.tex_optimizer
+    cfg.tex_tile_update = args.tex_tile_update
+    cfg.tex_tile_size   = max(16, int(args.tex_tile_size))
+    cfg.tex_tile_stride = max(0, int(args.tex_tile_stride))
+    cfg.tex_tile_random = not args.tex_tile_sequential
     cfg.l1_weight       = args.l1_weight
     cfg.ssim_weight     = args.ssim_weight
     cfg.ssim_backend    = args.ssim_backend

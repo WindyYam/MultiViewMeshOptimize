@@ -96,6 +96,10 @@ class TrainConfig:
     image_fs_cache:        bool  = True
     image_cache_dir:       Optional[str] = None
     tex_seam_pad_px:       int   = 12
+    tex_tile_update:       bool  = False
+    tex_tile_size:         int   = 1024
+    tex_tile_stride:       int   = 0
+    tex_tile_random:       bool  = True
     # If >0, alternate between texture and geometry updates every N iterations
     # during the joint phase to avoid them fighting each other.
     alter_every:           int   = 0
@@ -400,6 +404,19 @@ class TexturePPISPTrainer(TextureExportMixin):
             init_image=scene.mesh.tex_image,
         ).to(self.device)
         self._cast_texture_parameter()
+        self._tile_tex_enabled = bool(getattr(config, "tex_tile_update", False))
+        self._tile_tex_size = max(16, int(getattr(config, "tex_tile_size", 1024)))
+        stride_cfg = int(getattr(config, "tex_tile_stride", 0))
+        self._tile_tex_stride = self._tile_tex_size if stride_cfg <= 0 else stride_cfg
+        self._tile_tex_random = bool(getattr(config, "tex_tile_random", True))
+        self._texture_tiles: List[Tuple[int, int, int, int]] = []
+        self._texture_tile_cursor = 0
+        self._active_texture_tile_idx: Optional[int] = None
+        self._active_texture_tile: Optional[Tuple[int, int, int, int]] = None
+        self._texture_tile_param: Optional[nn.Parameter] = None
+        self._opt_tex_tile = None
+        if self._tile_tex_enabled:
+            self._init_texture_tiling()
 
         # ---- PPISP ----
         v0 = scene.views[0]
@@ -475,13 +492,33 @@ class TexturePPISPTrainer(TextureExportMixin):
         print(f"[Trainer] Cameras   : {len(scene)}")
         print(f"[Trainer] Mesh      : {self.base_vertices.shape[0]:,} verts, {self.faces.shape[0]:,} faces")
         print(f"[Trainer] Texture   : {init_tex_h}×{init_tex_w} -> {self._full_tex_H}×{self._full_tex_W}  ({n_tex/1e6:.1f}M params)")
-        tex_mem = self._estimate_texture_memory_bytes(n_tex)
+        tex_mem = self._memory_breakdown(self.texture, self.opt_tex)
         print(
             f"[Trainer] TexOpt    : {str(config.tex_optimizer).lower()}  dtype={str(config.texture_dtype).lower()}"
             f" (active={str(self._texture_dtype).split('.')[-1]})"
         )
-        print(f"[Trainer] TexMem≈   : {tex_mem/1024**3:.2f} GiB (param+grad+opt state)")
+        print(
+            "[Trainer] TexMemNow : "
+            f"total={tex_mem['total_bytes']/1024**2:.2f} MiB "
+            f"(param={tex_mem['param_bytes']/1024**2:.2f}, "
+            f"grad={tex_mem['grad_bytes']/1024**2:.2f}, "
+            f"opt={tex_mem['opt_state_bytes']/1024**2:.2f})"
+        )
+        if tex_mem["estimated_full_total_bytes"] > tex_mem["total_bytes"]:
+            print(
+                "[Trainer] TexMemEst : "
+                f"{tex_mem['estimated_full_total_bytes']/1024**2:.2f} MiB "
+                "(after first backward/optimizer step)"
+            )
         print(f"[Trainer] PPISP     : {n_ppisp} params  ({len(scene)} cameras)")
+        ppisp_mem = self._memory_breakdown(self.ppisp, self.opt_ppisp)
+        print(
+            "[Trainer] PPISPMem  : "
+            f"total={ppisp_mem['total_bytes']/1024**2:.2f} MiB "
+            f"(param={ppisp_mem['param_bytes']/1024**2:.2f}, "
+            f"grad={ppisp_mem['grad_bytes']/1024**2:.2f}, "
+            f"opt={ppisp_mem['opt_state_bytes']/1024**2:.2f})"
+        )
         print(
             f"[Trainer] Geometry  : {'on' if self.learn_geometry else 'off'}"
             f"{f'  ({n_geom/1e6:.1f}M offset params)' if self.learn_geometry else ''}"
@@ -491,12 +528,24 @@ class TexturePPISPTrainer(TextureExportMixin):
                 f"[Trainer] WeldGeom  : {'on' if self._weld_enabled else 'off'}"
                 f"  ({self._num_weld_groups:,} groups from {self.base_vertices.shape[0]:,} verts)"
             )
-            geom_mem = self._estimate_geometry_memory_bytes(n_geom)
             print(
                 f"[Trainer] GeomOpt   : {str(config.geom_optimizer).lower()}  dtype={str(config.geometry_dtype).lower()}"
                 f" (active={str(self._geometry_dtype).split('.')[-1]})"
             )
-            print(f"[Trainer] GeomMem≈  : {geom_mem/1024**2:.2f} MiB (param+grad+opt state)")
+            geom_mem = self._memory_breakdown(self.texture, self.opt_geom, only_params=[self.geometry_offsets])
+            print(
+                "[Trainer] GeomMemNow: "
+                f"total={geom_mem['total_bytes']/1024**2:.2f} MiB "
+                f"(param={geom_mem['param_bytes']/1024**2:.2f}, "
+                f"grad={geom_mem['grad_bytes']/1024**2:.2f}, "
+                f"opt={geom_mem['opt_state_bytes']/1024**2:.2f})"
+            )
+            if geom_mem["estimated_full_total_bytes"] > geom_mem["total_bytes"]:
+                print(
+                    "[Trainer] GeomMemEst: "
+                    f"{geom_mem['estimated_full_total_bytes']/1024**2:.2f} MiB "
+                    "(after first backward/optimizer step)"
+                )
         print(
             f"[Trainer] AMP       : {'on' if self._amp_enabled else 'off'}"
             f"{f' ({config.amp_dtype})' if self._amp_enabled else ''}"
@@ -518,6 +567,15 @@ class TexturePPISPTrainer(TextureExportMixin):
             )
         else:
             print("[Trainer] TexProg   : off")
+        if self._tile_tex_enabled:
+            print(
+                "[Trainer] TexTile   : "
+                f"on  size={self._tile_tex_size} stride={self._tile_tex_stride} "
+                f"mode={'random' if self._tile_tex_random else 'sequential'} "
+                f"tiles={len(self._texture_tiles)}"
+            )
+        else:
+            print("[Trainer] TexTile   : off")
         print(
             "[Trainer] UpdateFreq : "
             f"tex every {max(1, int(config.tex_update_every))} it, "
@@ -549,12 +607,14 @@ class TexturePPISPTrainer(TextureExportMixin):
             print(f"[Trainer] FaceAdj    : {n_adj:,} adjacent face pairs")
         print(f"[Trainer] Iterations: {config.num_iterations}")
 
-    def _create_tex_optimizer(self):
+    def _create_tex_optimizer(self, params=None):
+        if params is None:
+            params = self.texture.parameters()
         mode = str(self.cfg.tex_optimizer).lower()
         if mode == "sgd":
-            return optim.SGD(self.texture.parameters(), lr=self.cfg.lr_texture, momentum=0.9, nesterov=True)
+            return optim.SGD(params, lr=self.cfg.lr_texture, momentum=0.9, nesterov=True)
         return self._create_adam(
-            self.texture.parameters(),
+            params,
             lr=self.cfg.lr_texture,
             betas=(0.9, 0.99),
             eps=1e-15,
@@ -611,18 +671,66 @@ class TexturePPISPTrainer(TextureExportMixin):
         self.geometry_offsets = nn.Parameter(casted, requires_grad=self.learn_geometry)
         self.vertex_offsets = self.geometry_offsets
 
-    def _estimate_texture_memory_bytes(self, n_tex: int) -> float:
-        bpp = torch.finfo(self._texture_dtype).bits // 8
-        mode = str(self.cfg.tex_optimizer).lower()
-        # param + grad + optimizer state tensors
-        state_mult = 2.0 if mode == "adam" else 0.0
-        return float(n_tex) * float(bpp) * (2.0 + state_mult)
+    @staticmethod
+    def _tensor_nbytes(t: torch.Tensor) -> int:
+        return int(t.numel()) * int(t.element_size())
 
-    def _estimate_geometry_memory_bytes(self, n_geom: int) -> float:
-        bpp = torch.finfo(self.geometry_offsets.dtype).bits // 8
-        mode = str(self.cfg.geom_optimizer).lower()
-        state_mult = 2.0 if mode == "adam" else 0.0
-        return float(n_geom) * float(bpp) * (2.0 + state_mult)
+    @classmethod
+    def _sum_tensor_tree_bytes(cls, obj) -> int:
+        if torch.is_tensor(obj):
+            return cls._tensor_nbytes(obj)
+        if isinstance(obj, dict):
+            return sum(cls._sum_tensor_tree_bytes(v) for v in obj.values())
+        if isinstance(obj, (list, tuple, set)):
+            return sum(cls._sum_tensor_tree_bytes(v) for v in obj)
+        return 0
+
+    def _optimizer_state_slots_hint(self, optimizer) -> int:
+        if optimizer is None:
+            return 0
+        name = optimizer.__class__.__name__.lower()
+        if "adam" in name:
+            return 2  # exp_avg, exp_avg_sq
+        if "sgd" in name:
+            has_momentum = any(float(g.get("momentum", 0.0)) > 0.0 for g in optimizer.param_groups)
+            return 1 if has_momentum else 0
+        return 0
+
+    def _memory_breakdown(self, module: nn.Module, optimizer, only_params: Optional[List[torch.Tensor]] = None) -> dict:
+        if only_params is None:
+            params = list(module.parameters())
+        else:
+            params = list(only_params)
+
+        param_bytes = sum(self._tensor_nbytes(p.data) for p in params)
+        grad_bytes = sum(self._tensor_nbytes(p.grad) for p in params if p.grad is not None)
+
+        opt_state_bytes = 0
+        if optimizer is not None:
+            for state in optimizer.state.values():
+                opt_state_bytes += self._sum_tensor_tree_bytes(state)
+
+        missing_grad_bytes = sum(
+            self._tensor_nbytes(p.data)
+            for p in params
+            if p.requires_grad and p.grad is None
+        )
+        slots_hint = self._optimizer_state_slots_hint(optimizer)
+        missing_opt_state_bytes = 0
+        if optimizer is not None and slots_hint > 0:
+            for p in params:
+                if p not in optimizer.state:
+                    missing_opt_state_bytes += slots_hint * self._tensor_nbytes(p.data)
+
+        total_bytes = int(param_bytes + grad_bytes + opt_state_bytes)
+        estimated_full_total_bytes = int(total_bytes + missing_grad_bytes + missing_opt_state_bytes)
+        return {
+            "param_bytes": int(param_bytes),
+            "grad_bytes": int(grad_bytes),
+            "opt_state_bytes": int(opt_state_bytes),
+            "total_bytes": total_bytes,
+            "estimated_full_total_bytes": estimated_full_total_bytes,
+        }
 
     def _create_adam(self, params, lr: float, betas=(0.9, 0.999), eps=1e-8):
         kwargs = {
@@ -632,13 +740,13 @@ class TexturePPISPTrainer(TextureExportMixin):
         }
         if self.device.type == "cuda":
             try:
-                return optim.Adam(params, fused=True, **kwargs)
+                return optim.AdamW(params, fused=True, **kwargs)
             except Exception:
                 try:
-                    return optim.Adam(params, foreach=True, **kwargs)
+                    return optim.AdamW(params, foreach=True, **kwargs)
                 except Exception:
-                    return optim.Adam(params, **kwargs)
-        return optim.Adam(params, **kwargs)
+                    return optim.AdamW(params, **kwargs)
+        return optim.AdamW(params, **kwargs)
 
     def _build_tex_stage_iters(self, total_iters: int):
         if total_iters <= 1:
@@ -682,7 +790,94 @@ class TexturePPISPTrainer(TextureExportMixin):
             order.extend(torch.randperm(num_views, generator=gen).tolist())
         return order[:num_iters]
 
+    def _build_texture_tiles(self, tex_h: int, tex_w: int) -> List[Tuple[int, int, int, int]]:
+        tile = max(16, int(self._tile_tex_size))
+        stride = max(1, int(self._tile_tex_stride))
+
+        ys = list(range(0, max(1, tex_h - tile + 1), stride))
+        xs = list(range(0, max(1, tex_w - tile + 1), stride))
+        if not ys:
+            ys = [0]
+        if not xs:
+            xs = [0]
+        if ys[-1] != max(0, tex_h - tile):
+            ys.append(max(0, tex_h - tile))
+        if xs[-1] != max(0, tex_w - tile):
+            xs.append(max(0, tex_w - tile))
+
+        tiles = []
+        for y0 in ys:
+            y1 = min(tex_h, y0 + tile)
+            for x0 in xs:
+                x1 = min(tex_w, x0 + tile)
+                tiles.append((int(y0), int(y1), int(x0), int(x1)))
+        return tiles
+
+    def _init_texture_tiling(self):
+        self.texture.tex.requires_grad_(False)
+        self._texture_tiles = self._build_texture_tiles(
+            int(self.texture.tex.shape[2]), int(self.texture.tex.shape[3])
+        )
+        self._texture_tile_cursor = 0
+        self._active_texture_tile_idx = None
+        self._active_texture_tile = None
+        self._texture_tile_param = None
+        self._opt_tex_tile = None
+
+    def _commit_active_texture_tile(self, release: bool = True):
+        if self._texture_tile_param is None or self._active_texture_tile is None:
+            return
+        y0, y1, x0, x1 = self._active_texture_tile
+        with torch.no_grad():
+            self.texture.tex[..., y0:y1, x0:x1].copy_(self._texture_tile_param.detach())
+        if release:
+            self._texture_tile_param = None
+            self._opt_tex_tile = None
+            self._active_texture_tile = None
+            self._active_texture_tile_idx = None
+
+    def _next_texture_tile_index(self) -> int:
+        n_tiles = len(self._texture_tiles)
+        if n_tiles <= 0:
+            return 0
+        if self._tile_tex_random:
+            return random.randrange(n_tiles)
+        idx = self._texture_tile_cursor % n_tiles
+        self._texture_tile_cursor += 1
+        return idx
+
+    def _activate_texture_tile(self, tile_idx: int):
+        if not self._tile_tex_enabled:
+            return
+        tile_idx = int(max(0, min(tile_idx, len(self._texture_tiles) - 1)))
+        if self._active_texture_tile_idx == tile_idx and self._texture_tile_param is not None:
+            return
+
+        self._commit_active_texture_tile(release=True)
+
+        y0, y1, x0, x1 = self._texture_tiles[tile_idx]
+        patch = self.texture.tex[..., y0:y1, x0:x1].detach().clone()
+        self._texture_tile_param = nn.Parameter(patch, requires_grad=True)
+        self._opt_tex_tile = self._create_tex_optimizer(params=[self._texture_tile_param])
+        self._active_texture_tile = (y0, y1, x0, x1)
+        self._active_texture_tile_idx = tile_idx
+
+    def _texture_tensor_for_render(self) -> Optional[torch.Tensor]:
+        if not self._tile_tex_enabled:
+            return None
+        if self._texture_tile_param is None or self._active_texture_tile is None:
+            return None
+
+        y0, y1, x0, x1 = self._active_texture_tile
+        base = self.texture.tex
+        base_patch = base[..., y0:y1, x0:x1].detach()
+        delta = self._texture_tile_param - base_patch
+        pad = (x0, int(base.shape[3]) - x1, y0, int(base.shape[2]) - y1)
+        return base + F.pad(delta, pad)
+
     def _set_texture_stage(self, stage: int):
+        if self._tile_tex_enabled:
+            self._commit_active_texture_tile(release=True)
         target_h, target_w = self._stage_texture_resolution(stage)
         cur_h = int(self.texture.tex.shape[2])
         cur_w = int(self.texture.tex.shape[3])
@@ -700,6 +895,8 @@ class TexturePPISPTrainer(TextureExportMixin):
             ).to(dtype=self._texture_dtype)
         self.texture.tex = nn.Parameter(tex_up)
         self.opt_tex = self._create_tex_optimizer()
+        if self._tile_tex_enabled:
+            self._init_texture_tiling()
         self._tex_stage = stage
         print(f"[Trainer] Texture upscale -> {target_h}x{target_w} (stage {stage+1}/2)")
 
@@ -1492,15 +1689,18 @@ class TexturePPISPTrainer(TextureExportMixin):
                 gy, gx = torch.meshgrid(ys, xs, indexing="ij")
                 self.ppisp.r2 = gx**2 + gy**2
 
+        tex_override = self._texture_tensor_for_render()
         if return_face_ids:
             hdr, mask, face_ids = self.rasterizer.render_with_mask_and_face_ids(
                 self.current_vertices(), self.faces, self.uvs,
                 self.texture, R, t, K, W, H,
+                texture_tensor=tex_override,
             )
         else:
             hdr, mask = self.rasterizer.render_with_mask(
                 self.current_vertices(), self.faces, self.uvs,
                 self.texture, R, t, K, W, H,
+                texture_tensor=tex_override,
             )
         ldr = self.ppisp(hdr, ci)
         pred = ldr * mask
@@ -1528,8 +1728,16 @@ class TexturePPISPTrainer(TextureExportMixin):
             self.iter >= self.cfg.warmup_iters
             and ((self.iter - self.cfg.warmup_iters) % tex_every == 0)
         )
-        for p in self.texture.parameters():
-            p.requires_grad_(train_tex)
+        if self._tile_tex_enabled:
+            for p in self.texture.parameters():
+                p.requires_grad_(False)
+            if train_tex and len(self._texture_tiles) > 0:
+                self._activate_texture_tile(self._next_texture_tile_index())
+            else:
+                self._commit_active_texture_tile(release=True)
+        else:
+            for p in self.texture.parameters():
+                p.requires_grad_(train_tex)
 
         geom_every = max(1, int(self.cfg.geom_update_every))
         train_geom = (
@@ -1553,7 +1761,13 @@ class TexturePPISPTrainer(TextureExportMixin):
                     train_tex = False
         self.geometry_offsets.requires_grad_(train_geom)
 
-        self.opt_tex.zero_grad(set_to_none=True)
+        tex_opt = self._opt_tex_tile if self._tile_tex_enabled else self.opt_tex
+        tex_params = ([self._texture_tile_param]
+                      if (self._tile_tex_enabled and self._texture_tile_param is not None)
+                      else list(self.texture.parameters()))
+
+        if tex_opt is not None:
+            tex_opt.zero_grad(set_to_none=True)
         self.opt_ppisp.zero_grad(set_to_none=True)
         if self.opt_geom is not None:
             self.opt_geom.zero_grad(set_to_none=True)
@@ -1594,7 +1808,8 @@ class TexturePPISPTrainer(TextureExportMixin):
         total = losses["total"]
 
         if not torch.isfinite(total):
-            self.opt_tex.zero_grad(set_to_none=True)
+            if tex_opt is not None:
+                tex_opt.zero_grad(set_to_none=True)
             self.opt_ppisp.zero_grad(set_to_none=True)
             if self.opt_geom is not None:
                 self.opt_geom.zero_grad(set_to_none=True)
@@ -1614,15 +1829,15 @@ class TexturePPISPTrainer(TextureExportMixin):
 
             self._grad_scaler.unscale_(self.opt_ppisp)
             torch.nn.utils.clip_grad_norm_(self.ppisp.parameters(), 1.0)
-            if train_tex:
-                self._grad_scaler.unscale_(self.opt_tex)
-                torch.nn.utils.clip_grad_norm_(self.texture.parameters(), 1.0)
+            if train_tex and tex_opt is not None:
+                self._grad_scaler.unscale_(tex_opt)
+                torch.nn.utils.clip_grad_norm_(tex_params, 1.0)
             if train_geom and self.opt_geom is not None:
                 self._grad_scaler.unscale_(self.opt_geom)
                 torch.nn.utils.clip_grad_norm_([self.geometry_offsets], 1.0)
 
-            if train_tex:
-                self._grad_scaler.step(self.opt_tex)
+            if train_tex and tex_opt is not None:
+                self._grad_scaler.step(tex_opt)
             if train_geom and self.opt_geom is not None:
                 self._grad_scaler.step(self.opt_geom)
             self._grad_scaler.step(self.opt_ppisp)
@@ -1630,13 +1845,16 @@ class TexturePPISPTrainer(TextureExportMixin):
         else:
             total.backward()
             torch.nn.utils.clip_grad_norm_(self.ppisp.parameters(), 1.0)
-            if train_tex:
-                torch.nn.utils.clip_grad_norm_(self.texture.parameters(), 1.0)
-                self.opt_tex.step()
+            if train_tex and tex_opt is not None:
+                torch.nn.utils.clip_grad_norm_(tex_params, 1.0)
+                tex_opt.step()
             if train_geom and self.opt_geom is not None:
                 torch.nn.utils.clip_grad_norm_([self.geometry_offsets], 1.0)
                 self.opt_geom.step()
             self.opt_ppisp.step()
+
+        if self._tile_tex_enabled and train_tex:
+            self._commit_active_texture_tile(release=True)
 
         out = {
             **losses,
@@ -1654,7 +1872,12 @@ class TexturePPISPTrainer(TextureExportMixin):
             t = min((self.iter - self._lr_decay_start_eff) / self._lr_decay_iters_eff, 1.0)
             f = cfg.lr_decay_factor + (1 - cfg.lr_decay_factor) * 0.5 * (
                 1 + math.cos(math.pi * t))
-            for g in self.opt_tex.param_groups:   g["lr"] = cfg.lr_texture * f
+            if self.opt_tex is not None:
+                for g in self.opt_tex.param_groups:
+                    g["lr"] = cfg.lr_texture * f
+            if self._opt_tex_tile is not None:
+                for g in self._opt_tex_tile.param_groups:
+                    g["lr"] = cfg.lr_texture * f
             for g in self.opt_ppisp.param_groups: g["lr"] = cfg.lr_ppisp   * f
             if self.opt_geom is not None:
                 for g in self.opt_geom.param_groups:
@@ -1800,6 +2023,8 @@ class TexturePPISPTrainer(TextureExportMixin):
         print(f"[Trainer] LossPlot  : {out_path}")
 
     def _save_checkpoint(self, iteration: int):
+        if self._tile_tex_enabled:
+            self._commit_active_texture_tile(release=True)
         path = os.path.join(self.cfg.output_dir, f"checkpoint_{iteration:06d}.pt")
         torch.save({
             "iteration":  iteration,
@@ -1808,7 +2033,7 @@ class TexturePPISPTrainer(TextureExportMixin):
             "mesh_uvs": self.uvs.detach().cpu(),
             "texture":    self.texture.state_dict(),
             "ppisp":      self.ppisp.state_dict(),
-            "opt_tex":    self.opt_tex.state_dict(),
+            "opt_tex":    self.opt_tex.state_dict() if self.opt_tex is not None else None,
             "opt_ppisp":  self.opt_ppisp.state_dict(),
             "tex_stage":  int(self._tex_stage),
             "vertex_offsets": self.geometry_offsets.detach().cpu() if self.learn_geometry else None,
@@ -1869,7 +2094,10 @@ class TexturePPISPTrainer(TextureExportMixin):
 
         self.texture.load_state_dict(ckpt["texture"])
         self.ppisp.load_state_dict(ckpt["ppisp"])
-        self.opt_tex.load_state_dict(ckpt["opt_tex"])
+        if self._tile_tex_enabled:
+            self._init_texture_tiling()
+        if self.opt_tex is not None and ckpt.get("opt_tex") is not None:
+            self.opt_tex.load_state_dict(ckpt["opt_tex"])
         self.opt_ppisp.load_state_dict(ckpt["opt_ppisp"])
         self._tex_stage = int(ckpt.get("tex_stage", self._texture_stage_for_iter(int(ckpt["iteration"]))))
         if self.learn_geometry:
