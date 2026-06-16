@@ -65,7 +65,7 @@ def parse_args():
     p.add_argument("--ssim_backend", type=str, default="auto",
                    choices=["auto", "native", "msssim"],
                    help="SSIM backend: auto (prefer pytorch_msssim), native, or msssim")
-    p.add_argument("--lr_geom",     type=float, default=1e-4,
+    p.add_argument("--lr_geom",     type=float, default=5e-4,
                    help="Geometry (vertex offsets) learning rate")
     p.add_argument("--warmup",      type=int,   default=500,
                    help="Warmup iterations (PPISP only, texture frozen)")
@@ -159,6 +159,8 @@ def parse_args():
                    help="Minimum face count required to run topology adaptation")
     p.add_argument("--topology_max_faces", type=int, default=0,
                    help="Hard cap on face count after adaptation (0=disabled)")
+    p.add_argument("--backface_cull", action="store_true",
+                   help="Enable backface culling during rasterization")
     return p.parse_args()
 
 
@@ -269,6 +271,7 @@ def main():
     cfg.topology_start_iter = args.topology_start_iter
     cfg.topology_min_faces = max(4, int(args.topology_min_faces))
     cfg.topology_max_faces = max(0, int(args.topology_max_faces))
+    cfg.cull_backfaces = args.backface_cull
     cfg.device          = str(device)
 
     trainer = TexturePPISPTrainer(scene, cfg)

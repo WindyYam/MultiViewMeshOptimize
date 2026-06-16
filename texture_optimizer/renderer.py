@@ -97,8 +97,9 @@ def to_clip_space(vertices: torch.Tensor,
 class NvdiffrastRasterizer:
     """Fast GPU rasterizer — requires: pip install nvdiffrast"""
 
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, cull_backfaces: bool = True):
         self.device    = device
+        self.cull_backfaces = cull_backfaces
         self.available = False
         try:
             import nvdiffrast.torch as dr
@@ -127,6 +128,24 @@ class NvdiffrastRasterizer:
                 except Exception as e2:
                     print(f"[Renderer] GL fallback failed: {e2}")
 
+    @staticmethod
+    def _cull_backfaces(vertices: torch.Tensor,
+                        faces: torch.Tensor,
+                        R: torch.Tensor,
+                        t: torch.Tensor) -> torch.Tensor:
+        """Return only front-facing faces using camera-space winding."""
+        pts_cam = (R @ vertices.T).T + t
+        tris = pts_cam[faces.to(torch.long)]
+        e1 = tris[:, 1] - tris[:, 0]
+        e2 = tris[:, 2] - tris[:, 0]
+        normals = torch.cross(e1, e2, dim=1)
+        centers = tris.mean(dim=1)
+
+        # Camera is at origin in camera space; keep faces whose normal points
+        # toward camera (front-facing).
+        front_facing = (normals * (-centers)).sum(dim=1) > 0
+        return faces[front_facing]
+
     def render(self,
                vertices: torch.Tensor,  # (V,3) world, float32
                faces:    torch.Tensor,  # (F,3) int32
@@ -140,7 +159,23 @@ class NvdiffrastRasterizer:
         """Returns (H, W, 3) float32. Fully differentiable."""
         dr = self.dr
 
-        faces_i32 = faces.to(torch.int32).contiguous()
+        if self.cull_backfaces:
+            faces_front = self._cull_backfaces(vertices, faces, R, t)
+            faces_i32 = faces_front.to(torch.int32).contiguous()
+        else:
+            faces_i32 = faces.to(torch.int32).contiguous()
+
+        if faces_i32.numel() == 0:
+            color = torch.zeros((H, W, 3), device=vertices.device, dtype=vertices.dtype)
+            if not return_mask and not return_face_ids:
+                return color
+            mask = torch.zeros((H, W, 1), device=vertices.device, dtype=vertices.dtype)
+            if return_face_ids:
+                face_ids = torch.full((H, W), -1, device=vertices.device, dtype=torch.long)
+                if return_mask:
+                    return color, mask, face_ids
+                return color, face_ids
+            return color, mask
 
         # 1) Project to clip space
         verts_clip = to_clip_space(vertices, R, t, K, W, H)      # (1,V,4)
@@ -200,8 +235,8 @@ class NvdiffrastRasterizer:
 # ---------------------------------------------------------------------------
 
 class Rasterizer:
-    def __init__(self, device: torch.device):
-        self._nvdr = NvdiffrastRasterizer(device)
+    def __init__(self, device: torch.device, cull_backfaces: bool = True):
+        self._nvdr = NvdiffrastRasterizer(device, cull_backfaces=cull_backfaces)
         if not self._nvdr.available:
             raise RuntimeError(
                 "nvdiffrast is required but unavailable. Install with: pip install nvdiffrast"

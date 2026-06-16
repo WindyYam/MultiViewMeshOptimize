@@ -115,6 +115,7 @@ class TrainConfig:
     topology_start_iter:   Optional[int] = None
     topology_min_faces:    int   = 128
     topology_max_faces:    int   = 0
+    cull_backfaces:        bool  = False
 
 
 class AsyncImageCache:
@@ -431,7 +432,10 @@ class TexturePPISPTrainer(TextureExportMixin):
         ).to(self.device)
 
         # ---- Rasterizer ----
-        self.rasterizer = Rasterizer(self.device)
+        self.rasterizer = Rasterizer(
+            self.device,
+            cull_backfaces=bool(getattr(config, "cull_backfaces", False)),
+        )
 
         # ---- Pre-cache camera matrices on GPU ----
         self._cam_R = [v.R.to(self.device) for v in scene.views]
