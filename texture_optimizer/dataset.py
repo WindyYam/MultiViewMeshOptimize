@@ -546,8 +546,11 @@ def load_ply(ply_path: str) -> MeshData:
     vert_colors = None
     if ri2 is not None and gi2 is not None and bi2 is not None:
         vc = vert_data[:, [ri2, gi2, bi2]]
-        # uchar colours are in [0,255], float colours already [0,1]
-        vert_colors = torch.from_numpy(vc / 255.0 if vc.max() > 1.5 else vc)
+        # Interpret mesh vertex colours as sRGB and convert to linear so
+        # initialization matches the renderer's linear-light texture pipeline.
+        vc01 = vc / 255.0 if vc.max() > 1.5 else np.clip(vc, 0.0, 1.0)
+        vc_lin = _srgb_to_linear_np(vc01.astype(np.float32, copy=False))
+        vert_colors = torch.from_numpy(vc_lin.astype(np.float32, copy=False))
 
     # ------------------------------------------------------------------ UV handling
 

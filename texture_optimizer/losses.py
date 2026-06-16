@@ -20,7 +20,6 @@ try:
 except Exception:
     msssim_ssim = None
 
-
 # ---------------------------------------------------------------------------
 # SSIM (structural similarity) — differentiable, no external deps
 # ---------------------------------------------------------------------------
@@ -100,8 +99,24 @@ def _ssim_loss_msssim(
     Fast SSIM path using pytorch_msssim if available.
     pred / target: (H, W, 3) float32 in [0, data_range]
     """
-    if msssim_ssim is None or mask is not None:
+    if msssim_ssim is None:
         return _ssim_loss_native(pred, target, data_range=data_range, mask=mask)
+
+    if mask is not None:
+        valid = mask.to(device=pred.device, dtype=pred.dtype)
+        if valid.ndim == 2:
+            valid = valid.unsqueeze(-1)
+        elif valid.ndim == 3 and valid.shape[-1] == 1:
+            pass
+        elif valid.ndim == 3 and valid.shape[-1] == 3:
+            valid = valid[..., :1]
+        else:
+            valid = valid.view(pred.shape[0], pred.shape[1], 1)
+        valid = valid.clamp(0.0, 1.0)
+
+        # Fast masked SSIM approximation: outside valid pixels we set pred equal
+        # to detached target so invalid areas contribute ~zero and no gradient.
+        pred = pred * valid + target.detach() * (1.0 - valid)
 
     p = pred.permute(2, 0, 1).unsqueeze(0)
     t = target.permute(2, 0, 1).unsqueeze(0)

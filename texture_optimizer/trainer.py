@@ -1717,6 +1717,15 @@ class TexturePPISPTrainer(TextureExportMixin):
     # ------------------------------------------------------------------
 
     def step(self, view: CameraView, gt_image: Optional[torch.Tensor] = None) -> dict:
+        timing_sync_cuda = bool(getattr(self.cfg, "timing_sync_cuda", False))
+
+        def _sync_timing():
+            if timing_sync_cuda and self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+
+        _sync_timing()
+        t_step0 = time.perf_counter()
+
         gt = gt_image if gt_image is not None else view.gt_image
         if gt is None:
             raise ValueError(f"GT image not loaded for cam {view.cam_idx}")
@@ -1772,12 +1781,18 @@ class TexturePPISPTrainer(TextureExportMixin):
         if self.opt_geom is not None:
             self.opt_geom.zero_grad(set_to_none=True)
 
+        _sync_timing()
+        t_render0 = time.perf_counter()
         with self._autocast_ctx():
             pred, mesh_mask, face_ids = self.render_view(
                 view, return_mask=True, return_face_ids=True
             )
+        _sync_timing()
+        t_render_ms = (time.perf_counter() - t_render0) * 1000.0
 
         # Keep render in AMP, but evaluate objective in fp32 for stability.
+        _sync_timing()
+        t_loss0 = time.perf_counter()
         if self._amp_enabled and self.cfg.amp_loss_fp32:
             pred_loss = pred.float()
             gt_loss = gt.float()
@@ -1785,9 +1800,17 @@ class TexturePPISPTrainer(TextureExportMixin):
             pred_loss = pred
             gt_loss = gt
 
-        per_pixel_error = (pred_loss - gt_loss).abs().mean(dim=-1).detach()
-        self._accumulate_face_error(face_ids, per_pixel_error, mesh_mask)
+        t_faceerr_ms = 0.0
+        if int(getattr(self.cfg, "topology_adapt_every", 0) or 0) > 0:
+            _sync_timing()
+            t_faceerr0 = time.perf_counter()
+            per_pixel_error = (pred_loss - gt_loss).abs().mean(dim=-1).detach()
+            self._accumulate_face_error(face_ids, per_pixel_error, mesh_mask)
+            _sync_timing()
+            t_faceerr_ms = (time.perf_counter() - t_faceerr0) * 1000.0
 
+        _sync_timing()
+        t_lossfn0 = time.perf_counter()
         vertices_now = self.current_vertices() if train_geom else None
         losses = self.loss_fn(
             pred_loss,
@@ -1805,6 +1828,10 @@ class TexturePPISPTrainer(TextureExportMixin):
             num_weld_groups=self._num_weld_groups,
             weld_group_inv_counts=self._weld_group_inv_counts,
         )
+        _sync_timing()
+        t_lossfn_ms = (time.perf_counter() - t_lossfn0) * 1000.0
+        _sync_timing()
+        t_loss_ms = (time.perf_counter() - t_loss0) * 1000.0
         total = losses["total"]
 
         if not torch.isfinite(total):
@@ -1816,14 +1843,24 @@ class TexturePPISPTrainer(TextureExportMixin):
             if self._grad_scaler is not None:
                 cur_scale = float(self._grad_scaler.get_scale())
                 self._grad_scaler.update(new_scale=max(cur_scale * 0.5, 1.0))
+            _sync_timing()
+            t_step_ms = (time.perf_counter() - t_step0) * 1000.0
             return {
                 "total": float("nan"),
                 "photo": losses["photo"].detach().item(),
                 "ppisp_reg": losses["ppisp_reg"].detach().item(),
                 "geom_normal_tv": losses["geom_normal_tv"].detach().item(),
                 "geom_edge_uniform": losses["geom_edge_uniform"].detach().item(),
+                "time_render_ms": float(t_render_ms),
+                "time_loss_ms": float(t_loss_ms),
+                "time_faceerr_ms": float(t_faceerr_ms),
+                "time_lossfn_ms": float(t_lossfn_ms),
+                "time_backward_ms": 0.0,
+                "time_step_ms": float(t_step_ms),
             }
 
+        _sync_timing()
+        t_backward0 = time.perf_counter()
         if self._grad_scaler is not None:
             self._grad_scaler.scale(total).backward()
 
@@ -1856,8 +1893,18 @@ class TexturePPISPTrainer(TextureExportMixin):
         if self._tile_tex_enabled and train_tex:
             self._commit_active_texture_tile(release=True)
 
+        _sync_timing()
+        t_backward_ms = (time.perf_counter() - t_backward0) * 1000.0
+        t_step_ms = (time.perf_counter() - t_step0) * 1000.0
+
         out = {
             **losses,
+            "time_render_ms": float(t_render_ms),
+            "time_loss_ms": float(t_loss_ms),
+            "time_faceerr_ms": float(t_faceerr_ms),
+            "time_lossfn_ms": float(t_lossfn_ms),
+            "time_backward_ms": float(t_backward_ms),
+            "time_step_ms": float(t_step_ms),
         }
         return {k: v.item() if hasattr(v, "item") else v
                 for k, v in out.items()}
@@ -1904,6 +1951,15 @@ class TexturePPISPTrainer(TextureExportMixin):
         running = {k: 0.0 for k in (
             "total", "photo", "ppisp_reg", "geom_normal_tv", "geom_edge_uniform"
         )}
+        running_time = {
+            "data_ms": 0.0,
+            "render_ms": 0.0,
+            "loss_ms": 0.0,
+            "faceerr_ms": 0.0,
+            "lossfn_ms": 0.0,
+            "backward_ms": 0.0,
+            "step_ms": 0.0,
+        }
         t_iter  = time.time()
         try:
             for self.iter in range(cfg.num_iterations):
@@ -1916,7 +1972,9 @@ class TexturePPISPTrainer(TextureExportMixin):
                 if next_i0 < next_i1:
                     self._image_cache.prefetch([schedule[j] for j in range(next_i0, next_i1)])
 
+                t_data0 = time.perf_counter()
                 gt = self._image_cache.get(vidx)
+                data_ms = (time.perf_counter() - t_data0) * 1000.0
                 losses = self.step(view, gt_image=gt)
                 self._update_lr()
                 self._maybe_adapt_topology()
@@ -1925,6 +1983,13 @@ class TexturePPISPTrainer(TextureExportMixin):
 
                 for k in running:
                     running[k] += losses.get(k, 0.0)
+                running_time["data_ms"] += data_ms
+                running_time["render_ms"] += float(losses.get("time_render_ms", 0.0))
+                running_time["loss_ms"] += float(losses.get("time_loss_ms", 0.0))
+                running_time["faceerr_ms"] += float(losses.get("time_faceerr_ms", 0.0))
+                running_time["lossfn_ms"] += float(losses.get("time_lossfn_ms", 0.0))
+                running_time["backward_ms"] += float(losses.get("time_backward_ms", 0.0))
+                running_time["step_ms"] += float(losses.get("time_step_ms", 0.0))
                 self.loss_log.append({"iter": self.iter, **losses})
 
                 if (self.iter + 1) % cfg.log_every == 0:
@@ -1953,14 +2018,26 @@ class TexturePPISPTrainer(TextureExportMixin):
                     w_total = w_photo + w_ppisp_reg + w_normal_tv + w_edge_uniform
                     geom_txt = (f"w_nTV={w_normal_tv:.3e} w_eUni={w_edge_uniform:.3e}"
                                 if self.learn_geometry else "")
+                    t_data = running_time["data_ms"] / cfg.log_every
+                    t_render = running_time["render_ms"] / cfg.log_every
+                    t_loss = running_time["loss_ms"] / cfg.log_every
+                    t_faceerr = running_time["faceerr_ms"] / cfg.log_every
+                    t_lossfn = running_time["lossfn_ms"] / cfg.log_every
+                    t_backward = running_time["backward_ms"] / cfg.log_every
+                    t_step = running_time["step_ms"] / cfg.log_every
                     print(
                         f"  {self.iter+1:5d}/{cfg.num_iterations}  [{mode}]  "
                         f"w_loss={w_total:.4f}  w_photo={w_photo:.4f}  "
                         f"w_ppisp_reg={w_ppisp_reg:.5f}  "
                         f"{geom_txt} "
+                        f"t_data={t_data:.1f}ms  t_render={t_render:.1f}ms  "
+                        f"t_loss={t_loss:.1f}ms (face={t_faceerr:.1f}, lossfn={t_lossfn:.1f})  "
+                        f"t_bw={t_backward:.1f}ms  "
+                        f"t_step={t_step:.1f}ms  "
                         f"{it_per_s:.1f} it/s  ETA {eta_s/60:.1f}m"
                     )
                     running = {k: 0.0 for k in running}
+                    running_time = {k: 0.0 for k in running_time}
                     t_iter  = time.time()
                     if progress_callback:
                         progress_callback(self.iter + 1, cfg.num_iterations, losses)
