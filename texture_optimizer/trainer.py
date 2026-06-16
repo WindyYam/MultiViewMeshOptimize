@@ -47,6 +47,7 @@ class TrainConfig:
 
     photo_weight:     float = 1.0
     ppisp_reg_weight: float = 1e-2
+    ppisp_reg_scope:  str   = "active"    # all, active
     l1_weight:        float = 0.8
     ssim_weight:      float = 0.2
     ssim_backend:     str   = "auto"   # auto, native, msssim
@@ -89,6 +90,7 @@ class TrainConfig:
     amp_init_scale:        float = 1024.0
     amp_growth_interval:   int   = 2000
     use_tf32:              bool  = True
+    timing_sync_cuda:      bool  = False
     image_cpu_cache_size:  int   = 8
     image_gpu_cache_size:  int   = 3
     image_prefetch_ahead:  int   = 4
@@ -455,6 +457,7 @@ class TexturePPISPTrainer(TextureExportMixin):
         self.loss_fn = TotalLoss(
             photo_weight=config.photo_weight,
             ppisp_reg_weight=config.ppisp_reg_weight,
+            ppisp_reg_scope=config.ppisp_reg_scope,
             geom_normal_tv_weight=config.geom_normal_tv_weight,
             geom_normal_tv_delta=config.geom_normal_tv_delta,
             geom_edge_uniform_weight=config.geom_edge_uniform_weight,
@@ -1816,6 +1819,7 @@ class TexturePPISPTrainer(TextureExportMixin):
             pred_loss,
             gt_loss,
             self.ppisp,
+            cam_idx=view.cam_idx,
             mask=mesh_mask,
             learn_geometry=self.learn_geometry,
             train_geometry=train_geom,

@@ -296,27 +296,50 @@ class PPISPRegLoss(nn.Module):
         self.w_con  = contrast_weight
         self.w_vig  = vignette_weight
 
-    def forward(self, ppisp: "PPISPParams") -> torch.Tensor:
-        loss = torch.tensor(0.0, device=ppisp.log_exposure.device)
+    def forward(
+        self,
+        ppisp: "PPISPParams",
+        cam_idx: Optional[int] = None,
+    ) -> torch.Tensor:
+        # Optional single-camera path avoids touching all camera parameters every
+        # iteration and can reduce overhead on very large multi-view datasets.
+        if cam_idx is None:
+            log_exposure = ppisp.log_exposure
+            gamma_vals = ppisp.gamma()
+            log_wb = ppisp.log_wb
+            brightness = ppisp.brightness
+            log_contrast = ppisp.log_contrast
+            log_vignette_k = ppisp.log_vignette_k if ppisp.learn_vignette else None
+        else:
+            log_exposure = ppisp.log_exposure[cam_idx:cam_idx + 1]
+            gamma_vals = ppisp.gamma()[cam_idx:cam_idx + 1]
+            log_wb = ppisp.log_wb[cam_idx:cam_idx + 1]
+            brightness = ppisp.brightness[cam_idx:cam_idx + 1]
+            log_contrast = ppisp.log_contrast[cam_idx:cam_idx + 1]
+            log_vignette_k = (
+                ppisp.log_vignette_k[cam_idx:cam_idx + 1] if ppisp.learn_vignette else None
+            )
+
+        loss = torch.zeros((), device=ppisp.log_exposure.device, dtype=ppisp.log_exposure.dtype)
 
         # exposure → 1  (log → 0)
-        loss = loss + self.w_exp * ppisp.log_exposure.pow(2).mean()
+        loss = loss + self.w_exp * log_exposure.pow(2).mean()
 
         # gamma → 2.2  (softplus(raw) + 0.5 = 2.2  →  raw ≈ 1.67)
-        loss = loss + self.w_gam * (ppisp.gamma() - 2.2).pow(2).mean()
+        loss = loss + self.w_gam * (gamma_vals - 2.2).pow(2).mean()
 
         # wb → 1  (log → 0)
-        loss = loss + self.w_wb  * ppisp.log_wb.pow(2).mean()
+        loss = loss + self.w_wb  * log_wb.pow(2).mean()
 
         # brightness → 0
-        loss = loss + self.w_bri * ppisp.brightness.pow(2).mean()
+        loss = loss + self.w_bri * brightness.pow(2).mean()
 
         # contrast → 1  (log → 0)
-        loss = loss + self.w_con * ppisp.log_contrast.pow(2).mean()
+        loss = loss + self.w_con * log_contrast.pow(2).mean()
 
         # vignette → near-0  (log_k → -4 ≈ k≈0.018)
-        if ppisp.learn_vignette:
-            loss = loss + self.w_vig * (ppisp.log_vignette_k + 4.0).pow(2).mean()
+        if ppisp.learn_vignette and log_vignette_k is not None:
+            loss = loss + self.w_vig * (log_vignette_k + 4.0).pow(2).mean()
 
         return loss
 
@@ -334,6 +357,7 @@ class TotalLoss(nn.Module):
         self,
         photo_weight:      float = 1.0,
         ppisp_reg_weight:  float = 1e-2,
+        ppisp_reg_scope: str = "all",
         geom_normal_tv_weight: float = 0.0,
         geom_normal_tv_delta: float = 1e-3,
         geom_edge_uniform_weight: float = 0.0,
@@ -345,6 +369,7 @@ class TotalLoss(nn.Module):
         super().__init__()
         self.w_photo    = photo_weight
         self.w_ppisp    = ppisp_reg_weight
+        self.ppisp_reg_scope = str(ppisp_reg_scope).lower()
         self.w_geom_tv  = geom_normal_tv_weight
         self.geom_tv_delta = geom_normal_tv_delta
         self.w_geom_edge_uniform = geom_edge_uniform_weight
@@ -362,6 +387,7 @@ class TotalLoss(nn.Module):
         pred:    torch.Tensor,
         target:  torch.Tensor,
         ppisp:   "PPISPParams",
+        cam_idx: Optional[int] = None,
         mask:    Optional[torch.Tensor] = None,
         learn_geometry: bool = False,
         train_geometry: bool = False,
@@ -375,7 +401,12 @@ class TotalLoss(nn.Module):
         weld_group_inv_counts: Optional[torch.Tensor] = None,
     ) -> dict:
         photo = self.photo_loss(pred, target, mask)
-        p_reg = self.ppisp_reg(ppisp)
+        if self.w_ppisp == 0.0:
+            p_reg = torch.zeros((), device=pred.device, dtype=pred.dtype)
+        elif self.ppisp_reg_scope == "active" and cam_idx is not None:
+            p_reg = self.ppisp_reg(ppisp, cam_idx=cam_idx)
+        else:
+            p_reg = self.ppisp_reg(ppisp)
 
         if learn_geometry and train_geometry and vertices is not None and faces is not None:
             geom_normal_tv = _geometry_normal_tv_loss(
