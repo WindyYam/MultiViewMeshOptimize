@@ -28,14 +28,18 @@ class TextureExportMixin:
         uvs_out[:, 0] = np.clip(uvs_out[:, 0], 0.0, 1.0)
         uvs_out[:, 1] = np.clip(1.0 - uvs_out[:, 1], 0.0, 1.0)
 
-        # Weld duplicated vertices by rounded XYZ to reduce seam duplication in output.
-        # UVs remain face-corner attributes (texcoord list), so seam UVs are preserved.
+        # Weld duplicated vertices by rounded XYZ+UV to reduce exact duplicates
+        # while preserving UV seams (same XYZ but different UV remain distinct).
         weld_decimals = max(0, int(getattr(self.cfg, "weld_position_decimals", 6)))
-        weld_keys = np.round(verts, decimals=weld_decimals)
+        weld_keys = np.concatenate([
+            np.round(verts, decimals=weld_decimals),
+            np.round(uvs_out, decimals=weld_decimals),
+        ], axis=1)
         _, unique_first_idx, inverse = np.unique(
             weld_keys, axis=0, return_index=True, return_inverse=True
         )
         verts_weld = verts[unique_first_idx].astype(np.float32, copy=False)
+        uvs_weld = uvs_out[unique_first_idx].astype(np.float32, copy=False)
         faces_weld = inverse[faces].astype(np.int32, copy=False)
 
         # Keep only non-degenerate triangles after welding.
@@ -46,23 +50,27 @@ class TextureExportMixin:
         )
         faces_out = faces_weld[valid_face_mask]
 
-        vertex_block = verts_weld.astype(np.float32, copy=False)
-
-        # Face-level UV list layout: [u0, v0, u1, v1, u2, v2] per triangle.
-        tri_uv = uvs_out[faces].reshape(-1, 6).astype(np.float32, copy=False)
-        tri_uv_out = tri_uv[valid_face_mask]
+        vertex_dtype = np.dtype([
+            ("x", "<f4"),
+            ("y", "<f4"),
+            ("z", "<f4"),
+            ("texture_u", "<f4"),
+            ("texture_v", "<f4"),
+        ])
+        vertex_block = np.empty(verts_weld.shape[0], dtype=vertex_dtype)
+        vertex_block["x"] = verts_weld[:, 0]
+        vertex_block["y"] = verts_weld[:, 1]
+        vertex_block["z"] = verts_weld[:, 2]
+        vertex_block["texture_u"] = uvs_weld[:, 0]
+        vertex_block["texture_v"] = uvs_weld[:, 1]
 
         face_dtype = np.dtype([
             ("n", np.uint8),
             ("idx", "<i4", (3,)),
-            ("tc_n", np.uint8),
-            ("tc", "<f4", (6,)),
         ])
         face_block = np.empty(faces_out.shape[0], dtype=face_dtype)
         face_block["n"] = 3
         face_block["idx"] = faces_out
-        face_block["tc_n"] = 6
-        face_block["tc"] = tri_uv_out
 
         header = (
             "ply\n"
@@ -72,9 +80,10 @@ class TextureExportMixin:
             "property float x\n"
             "property float y\n"
             "property float z\n"
+            "property float texture_u\n"
+            "property float texture_v\n"
             f"element face {face_block.shape[0]}\n"
             "property list uchar int vertex_indices\n"
-            "property list uchar float texcoord\n"
             "end_header\n"
         )
 

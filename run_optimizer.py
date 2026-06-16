@@ -65,7 +65,7 @@ def parse_args():
     p.add_argument("--ssim_backend", type=str, default="auto",
                    choices=["auto", "native", "msssim"],
                    help="SSIM backend: auto (prefer pytorch_msssim), native, or msssim")
-    p.add_argument("--lr_geom",     type=float, default=5e-4,
+    p.add_argument("--lr_geom",     type=float, default=2e-4,
                    help="Geometry (vertex offsets) learning rate")
     p.add_argument("--warmup",      type=int,   default=500,
                    help="Warmup iterations (PPISP only, texture frozen)")
