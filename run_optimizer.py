@@ -139,6 +139,14 @@ def parse_args():
                    help="Filesystem cache directory for GT images (default: <output>/image_cache)")
     p.add_argument("--tex_seam_pad", type=int, default=10,
                    help="UV seam padding in pixels applied on export texture to reduce visible seams")
+    p.add_argument("--enable_skybox", action="store_true",
+                   help="Enable trainable skybox branch (inward-facing box with separate texture)")
+    p.add_argument("--skybox_scale", type=float, default=4.0,
+                   help="Skybox size multiplier relative to mesh scene extent")
+    p.add_argument("--skybox_tex_res", type=int, default=2048,
+                   help="Skybox texture resolution (square)")
+    p.add_argument("--lr_skybox", type=float, default=1e-3,
+                   help="Skybox texture learning rate")
     p.add_argument("--alter_every", type=int, default=0,
                    help="Alternate between texture and geometry updates every N iterations (0=disabled)")
     p.add_argument("--topology_adapt_every", type=int, default=0,
@@ -261,6 +269,10 @@ def main():
     cfg.image_fs_cache       = not args.no_image_fs_cache
     cfg.image_cache_dir      = args.image_cache_dir
     cfg.tex_seam_pad_px = max(0, int(args.tex_seam_pad))
+    cfg.enable_skybox = args.enable_skybox
+    cfg.skybox_scale = max(1.01, float(args.skybox_scale))
+    cfg.skybox_tex_res = max(16, int(args.skybox_tex_res))
+    cfg.lr_skybox = float(args.lr_skybox)
     cfg.alter_every = max(0, int(args.alter_every))
     cfg.topology_adapt_every = max(0, int(args.topology_adapt_every))
     cfg.topology_error_beta = float(args.topology_error_beta)

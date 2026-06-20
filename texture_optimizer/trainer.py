@@ -102,6 +102,10 @@ class TrainConfig:
     tex_tile_size:         int   = 1024
     tex_tile_stride:       int   = 0
     tex_tile_random:       bool  = True
+    enable_skybox:         bool  = False
+    skybox_scale:          float = 4.0
+    skybox_tex_res:        int   = 2048
+    lr_skybox:             float = 1e-3
     # If >0, alternate between texture and geometry updates every N iterations
     # during the joint phase to avoid them fighting each other.
     alter_every:           int   = 0
@@ -319,6 +323,7 @@ class TexturePPISPTrainer(TextureExportMixin):
         self._grad_scaler = None
         self._configure_acceleration()
         self._texture_dtype = self._resolve_texture_dtype(config.texture_dtype)
+        self._skybox_enabled = bool(getattr(config, "enable_skybox", False))
 
         # ---- Mesh ----
         self.base_vertices = scene.mesh.vertices.to(self.device)
@@ -407,6 +412,23 @@ class TexturePPISPTrainer(TextureExportMixin):
             init_image=scene.mesh.tex_image,
         ).to(self.device)
         self._cast_texture_parameter()
+
+        self.sky_vertices = None
+        self.sky_faces = None
+        self.sky_uvs = None
+        self.sky_texture = None
+        self.opt_sky = None
+        if self._skybox_enabled:
+            self.sky_vertices, self.sky_faces, self.sky_uvs = self._build_skybox_mesh(
+                self.base_vertices,
+                float(getattr(config, "skybox_scale", 4.0)),
+            )
+            sky_res = max(16, int(getattr(config, "skybox_tex_res", 2048)))
+            self.sky_texture = TextureMap(
+                sky_res, sky_res,
+                init_image=None,
+            ).to(self.device)
+            self._cast_texture_parameter(self.sky_texture)
         self._tile_tex_enabled = bool(getattr(config, "tex_tile_update", False))
         self._tile_tex_size = max(16, int(getattr(config, "tex_tile_size", 1024)))
         stride_cfg = int(getattr(config, "tex_tile_stride", 0))
@@ -473,6 +495,11 @@ class TexturePPISPTrainer(TextureExportMixin):
 
         # ---- Optimizers ----
         self.opt_tex   = self._create_tex_optimizer()
+        if self._skybox_enabled and self.sky_texture is not None:
+            self.opt_sky = self._create_tex_optimizer(
+                params=self.sky_texture.parameters(),
+                lr=float(getattr(config, "lr_skybox", config.lr_texture)),
+            )
         self.opt_ppisp = self._create_adam(self.ppisp.parameters(),
                            lr=config.lr_ppisp)
         self.opt_geom  = (self._create_geom_optimizer()
@@ -492,6 +519,8 @@ class TexturePPISPTrainer(TextureExportMixin):
         self._lr_decay_start_eff, self._lr_decay_iters_eff = self._resolve_lr_decay_schedule()
 
         n_tex = sum(p.numel() for p in self.texture.parameters())
+        n_sky = (sum(p.numel() for p in self.sky_texture.parameters())
+             if self.sky_texture is not None else 0)
         n_ppisp = sum(p.numel() for p in self.ppisp.parameters())
         n_geom = int(self.geometry_offsets.numel()) if self.learn_geometry else 0
         print(f"\n[Trainer] Device    : {self.device}")
@@ -517,6 +546,22 @@ class TexturePPISPTrainer(TextureExportMixin):
                 f"{tex_mem['estimated_full_total_bytes']/1024**2:.2f} MiB "
                 "(after first backward/optimizer step)"
             )
+        if self._skybox_enabled and self.sky_texture is not None:
+            print(
+                f"[Trainer] Skybox    : on  scale={float(getattr(config, 'skybox_scale', 4.0)):.2f} "
+                f"tex={int(self.sky_texture.tex.shape[2])}x{int(self.sky_texture.tex.shape[3])} "
+                f"({n_sky/1e6:.1f}M params)"
+            )
+            sky_mem = self._memory_breakdown(self.sky_texture, self.opt_sky)
+            print(
+                "[Trainer] SkyMemNow : "
+                f"total={sky_mem['total_bytes']/1024**2:.2f} MiB "
+                f"(param={sky_mem['param_bytes']/1024**2:.2f}, "
+                f"grad={sky_mem['grad_bytes']/1024**2:.2f}, "
+                f"opt={sky_mem['opt_state_bytes']/1024**2:.2f})"
+            )
+        else:
+            print("[Trainer] Skybox    : off")
         print(f"[Trainer] PPISP     : {n_ppisp} params  ({len(scene)} cameras)")
         ppisp_mem = self._memory_breakdown(self.ppisp, self.opt_ppisp)
         print(
@@ -614,15 +659,17 @@ class TexturePPISPTrainer(TextureExportMixin):
             print(f"[Trainer] FaceAdj    : {n_adj:,} adjacent face pairs")
         print(f"[Trainer] Iterations: {config.num_iterations}")
 
-    def _create_tex_optimizer(self, params=None):
+    def _create_tex_optimizer(self, params=None, lr: Optional[float] = None):
         if params is None:
             params = self.texture.parameters()
+        if lr is None:
+            lr = float(self.cfg.lr_texture)
         mode = str(self.cfg.tex_optimizer).lower()
         if mode == "sgd":
-            return optim.SGD(params, lr=self.cfg.lr_texture, momentum=0.9, nesterov=True)
+            return optim.SGD(params, lr=lr, momentum=0.9, nesterov=True)
         return self._create_adam(
             params,
-            lr=self.cfg.lr_texture,
+            lr=lr,
             betas=(0.9, 0.99),
             eps=1e-15,
         )
@@ -657,15 +704,95 @@ class TexturePPISPTrainer(TextureExportMixin):
             return torch.bfloat16
         return torch.float32
 
-    def _cast_texture_parameter(self):
+    def _cast_texture_parameter(self, texture_module: Optional[TextureMap] = None):
+        if texture_module is None:
+            texture_module = self.texture
         target_dtype = self._texture_dtype
         if self.device.type != "cuda" and target_dtype != torch.float32:
             target_dtype = torch.float32
-        if self.texture.tex.dtype == target_dtype:
+        if texture_module.tex.dtype == target_dtype:
             return
         with torch.no_grad():
-            casted = self.texture.tex.detach().to(dtype=target_dtype)
-        self.texture.tex = nn.Parameter(casted)
+            casted = texture_module.tex.detach().to(dtype=target_dtype)
+        texture_module.tex = nn.Parameter(casted)
+
+    def _build_skybox_mesh(self, base_vertices: torch.Tensor, scale_mul: float):
+        if base_vertices.numel() == 0:
+            center = torch.zeros(3, device=self.device, dtype=torch.float32)
+            extent = 1.0
+        else:
+            vmin = base_vertices.min(dim=0).values
+            vmax = base_vertices.max(dim=0).values
+            center = ((vmin + vmax) * 0.5).to(dtype=torch.float32)
+            extent = float(torch.max(vmax - vmin).detach().cpu().item())
+            if not np.isfinite(extent) or extent <= 1e-6:
+                extent = 1.0
+        half = max(1e-3, 0.5 * extent * float(max(1.01, scale_mul)))
+
+        cx, cy, cz = [float(x) for x in center.detach().cpu().tolist()]
+        corners = {
+            "nbl": [cx - half, cy - half, cz - half],
+            "nbr": [cx + half, cy - half, cz - half],
+            "ntl": [cx - half, cy + half, cz - half],
+            "ntr": [cx + half, cy + half, cz - half],
+            "fbl": [cx - half, cy - half, cz + half],
+            "fbr": [cx + half, cy - half, cz + half],
+            "ftl": [cx - half, cy + half, cz + half],
+            "ftr": [cx + half, cy + half, cz + half],
+        }
+
+        # Open-bottom skybox atlas: 5 equal-width tiles in a horizontal strip.
+        # This avoids allocating texture area to an unused ground face.
+        atlas = {
+            "front":  0,
+            "right":  1,
+            "back":   2,
+            "left":   3,
+            "top":    4,
+        }
+        cell_w = 1.0 / 5.0
+        cell_h = 1.0
+
+        faces_def = [
+            ("front", ("fbl", "fbr", "ftr", "ftl")),
+            ("right", ("fbr", "nbr", "ntr", "ftr")),
+            ("back", ("nbr", "nbl", "ntl", "ntr")),
+            ("left", ("nbl", "fbl", "ftl", "ntl")),
+            ("top", ("ntl", "ftl", "ftr", "ntr")),
+        ]
+
+        verts = []
+        uvs = []
+        tris = []
+        for name, quad in faces_def:
+            col = atlas[name]
+            u0 = col * cell_w
+            u1 = (col + 1) * cell_w
+            v0 = 0.0
+            v1 = 1.0
+            base = len(verts)
+            verts.extend([corners[k] for k in quad])
+            uvs.extend([
+                [u0, v1],
+                [u1, v1],
+                [u1, v0],
+                [u0, v0],
+            ])
+            tris.append([base + 0, base + 1, base + 2])
+            tris.append([base + 0, base + 2, base + 3])
+
+        verts_t = torch.tensor(verts, dtype=torch.float32, device=self.device)
+        faces_t = torch.tensor(tris, dtype=torch.long, device=self.device)
+        uvs_t = torch.tensor(uvs, dtype=torch.float32, device=self.device)
+
+        tri = verts_t[faces_t]
+        n = torch.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0], dim=1)
+        ctr = tri.mean(dim=1)
+        out_dir = ctr - center.to(device=self.device, dtype=verts_t.dtype)
+        bad = (n * out_dir).sum(dim=1) > 0
+        if torch.any(bad):
+            faces_t[bad] = faces_t[bad][:, [0, 2, 1]]
+        return verts_t, faces_t, uvs_t
 
     def _cast_geometry_parameter(self):
         target_dtype = self._geometry_dtype
@@ -1698,17 +1825,37 @@ class TexturePPISPTrainer(TextureExportMixin):
 
         tex_override = self._texture_tensor_for_render()
         if return_face_ids:
-            hdr, mask, face_ids = self.rasterizer.render_with_mask_and_face_ids(
+            hdr_mesh, mask_mesh, face_ids = self.rasterizer.render_with_mask_and_face_ids(
                 self.current_vertices(), self.faces, self.uvs,
                 self.texture, R, t, K, W, H,
                 texture_tensor=tex_override,
             )
         else:
-            hdr, mask = self.rasterizer.render_with_mask(
+            hdr_mesh, mask_mesh = self.rasterizer.render_with_mask(
                 self.current_vertices(), self.faces, self.uvs,
                 self.texture, R, t, K, W, H,
                 texture_tensor=tex_override,
             )
+
+        if self._skybox_enabled and self.sky_texture is not None and self.sky_vertices is not None:
+            hdr_sky, mask_sky = self.rasterizer.render_with_mask(
+                self.sky_vertices,
+                self.sky_faces,
+                self.sky_uvs,
+                self.sky_texture,
+                R,
+                t,
+                K,
+                W,
+                H,
+            )
+            mesh_fg = mask_mesh > 0.5
+            hdr = torch.where(mesh_fg, hdr_mesh, hdr_sky)
+            mask = torch.logical_or(mesh_fg, mask_sky > 0.5).to(dtype=hdr.dtype)
+        else:
+            hdr = hdr_mesh
+            mask = mask_mesh
+
         ldr = self.ppisp(hdr, ci)
         pred = ldr * mask
         if return_mask:
@@ -1754,6 +1901,9 @@ class TexturePPISPTrainer(TextureExportMixin):
         else:
             for p in self.texture.parameters():
                 p.requires_grad_(train_tex)
+        if self._skybox_enabled and self.sky_texture is not None:
+            for p in self.sky_texture.parameters():
+                p.requires_grad_(train_tex)
 
         geom_every = max(1, int(self.cfg.geom_update_every))
         train_geom = (
@@ -1781,9 +1931,12 @@ class TexturePPISPTrainer(TextureExportMixin):
         tex_params = ([self._texture_tile_param]
                       if (self._tile_tex_enabled and self._texture_tile_param is not None)
                       else list(self.texture.parameters()))
+        sky_params = list(self.sky_texture.parameters()) if self.sky_texture is not None else []
 
         if tex_opt is not None:
             tex_opt.zero_grad(set_to_none=True)
+        if self.opt_sky is not None:
+            self.opt_sky.zero_grad(set_to_none=True)
         self.opt_ppisp.zero_grad(set_to_none=True)
         if self.opt_geom is not None:
             self.opt_geom.zero_grad(set_to_none=True)
@@ -1845,6 +1998,8 @@ class TexturePPISPTrainer(TextureExportMixin):
         if not torch.isfinite(total):
             if tex_opt is not None:
                 tex_opt.zero_grad(set_to_none=True)
+            if self.opt_sky is not None:
+                self.opt_sky.zero_grad(set_to_none=True)
             self.opt_ppisp.zero_grad(set_to_none=True)
             if self.opt_geom is not None:
                 self.opt_geom.zero_grad(set_to_none=True)
@@ -1877,12 +2032,17 @@ class TexturePPISPTrainer(TextureExportMixin):
             if train_tex and tex_opt is not None:
                 self._grad_scaler.unscale_(tex_opt)
                 torch.nn.utils.clip_grad_norm_(tex_params, 1.0)
+            if train_tex and self.opt_sky is not None and sky_params:
+                self._grad_scaler.unscale_(self.opt_sky)
+                torch.nn.utils.clip_grad_norm_(sky_params, 1.0)
             if train_geom and self.opt_geom is not None:
                 self._grad_scaler.unscale_(self.opt_geom)
                 torch.nn.utils.clip_grad_norm_([self.geometry_offsets], 1.0)
 
             if train_tex and tex_opt is not None:
                 self._grad_scaler.step(tex_opt)
+            if train_tex and self.opt_sky is not None:
+                self._grad_scaler.step(self.opt_sky)
             if train_geom and self.opt_geom is not None:
                 self._grad_scaler.step(self.opt_geom)
             self._grad_scaler.step(self.opt_ppisp)
@@ -1893,6 +2053,9 @@ class TexturePPISPTrainer(TextureExportMixin):
             if train_tex and tex_opt is not None:
                 torch.nn.utils.clip_grad_norm_(tex_params, 1.0)
                 tex_opt.step()
+            if train_tex and self.opt_sky is not None and sky_params:
+                torch.nn.utils.clip_grad_norm_(sky_params, 1.0)
+                self.opt_sky.step()
             if train_geom and self.opt_geom is not None:
                 torch.nn.utils.clip_grad_norm_([self.geometry_offsets], 1.0)
                 self.opt_geom.step()
@@ -1933,6 +2096,9 @@ class TexturePPISPTrainer(TextureExportMixin):
             if self._opt_tex_tile is not None:
                 for g in self._opt_tex_tile.param_groups:
                     g["lr"] = cfg.lr_texture * f
+            if self.opt_sky is not None:
+                for g in self.opt_sky.param_groups:
+                    g["lr"] = float(getattr(cfg, "lr_skybox", cfg.lr_texture)) * f
             for g in self.opt_ppisp.param_groups: g["lr"] = cfg.lr_ppisp   * f
             if self.opt_geom is not None:
                 for g in self.opt_geom.param_groups:
@@ -2117,8 +2283,14 @@ class TexturePPISPTrainer(TextureExportMixin):
             "mesh_faces": self.faces.detach().cpu(),
             "mesh_uvs": self.uvs.detach().cpu(),
             "texture":    self.texture.state_dict(),
+            "skybox_enabled": bool(self._skybox_enabled),
+            "sky_vertices": self.sky_vertices.detach().cpu() if self.sky_vertices is not None else None,
+            "sky_faces": self.sky_faces.detach().cpu() if self.sky_faces is not None else None,
+            "sky_uvs": self.sky_uvs.detach().cpu() if self.sky_uvs is not None else None,
+            "sky_texture": self.sky_texture.state_dict() if self.sky_texture is not None else None,
             "ppisp":      self.ppisp.state_dict(),
             "opt_tex":    self.opt_tex.state_dict() if self.opt_tex is not None else None,
+            "opt_sky":    self.opt_sky.state_dict() if self.opt_sky is not None else None,
             "opt_ppisp":  self.opt_ppisp.state_dict(),
             "tex_stage":  int(self._tex_stage),
             "vertex_offsets": self.geometry_offsets.detach().cpu() if self.learn_geometry else None,
@@ -2178,6 +2350,20 @@ class TexturePPISPTrainer(TextureExportMixin):
                 self.opt_tex = self._create_tex_optimizer()
 
         self.texture.load_state_dict(ckpt["texture"])
+        sky_enabled_ckpt = bool(ckpt.get("skybox_enabled", False))
+        if self._skybox_enabled and sky_enabled_ckpt and self.sky_texture is not None:
+            sky_v = ckpt.get("sky_vertices")
+            sky_f = ckpt.get("sky_faces")
+            sky_uv = ckpt.get("sky_uvs")
+            if sky_v is not None and sky_f is not None and sky_uv is not None:
+                self.sky_vertices = sky_v.to(self.device)
+                self.sky_faces = sky_f.to(self.device)
+                self.sky_uvs = sky_uv.to(self.device)
+            sky_blob = ckpt.get("sky_texture")
+            if sky_blob is not None:
+                self.sky_texture.load_state_dict(sky_blob)
+            if self.opt_sky is not None and ckpt.get("opt_sky") is not None:
+                self.opt_sky.load_state_dict(ckpt["opt_sky"])
         self.ppisp.load_state_dict(ckpt["ppisp"])
         if self._tile_tex_enabled:
             self._init_texture_tiling()

@@ -7,42 +7,46 @@ from PIL import Image, ImageDraw
 
 class TextureExportMixin:
 
-    def _export_mesh_ply(self, path: str, texture_file: str = "optimized_texture.png"):
-        """
-        Export textured mesh as binary little-endian PLY.
-        Uses per-vertex UV properties and a TextureFile header comment.
-        """
+    def _export_textured_ply(
+        self,
+        path: str,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        uvs: np.ndarray,
+        texture_file: str,
+        weld_vertices: bool = True,
+    ):
         texture_ref = texture_file or "optimized_texture.png"
-        verts = self.current_vertices().detach().cpu().numpy().astype(np.float32)
-        uvs = self.uvs.detach().cpu().numpy().astype(np.float32)
-        faces = self.faces.detach().cpu().numpy().astype(np.int32)
+        verts = np.asarray(vertices, dtype=np.float32)
+        uvs_in = np.asarray(uvs, dtype=np.float32)
+        faces_in = np.asarray(faces, dtype=np.int32)
 
-        if uvs.shape[0] != verts.shape[0]:
+        if uvs_in.shape[0] != verts.shape[0]:
             raise RuntimeError(
-                f"UV/vertex mismatch while exporting PLY: {uvs.shape[0]} uvs vs {verts.shape[0]} verts"
+                f"UV/vertex mismatch while exporting PLY: {uvs_in.shape[0]} uvs vs {verts.shape[0]} verts"
             )
 
-        # PLY consumers typically interpret UV V with bottom-origin semantics.
-        # Internal UVs are image-space top-origin, so flip V on export.
-        uvs_out = uvs.copy()
+        uvs_out = uvs_in.copy()
         uvs_out[:, 0] = np.clip(uvs_out[:, 0], 0.0, 1.0)
         uvs_out[:, 1] = np.clip(1.0 - uvs_out[:, 1], 0.0, 1.0)
 
-        # Weld duplicated vertices by rounded XYZ+UV to reduce exact duplicates
-        # while preserving UV seams (same XYZ but different UV remain distinct).
-        weld_decimals = max(0, int(getattr(self.cfg, "weld_position_decimals", 6)))
-        weld_keys = np.concatenate([
-            np.round(verts, decimals=weld_decimals),
-            np.round(uvs_out, decimals=weld_decimals),
-        ], axis=1)
-        _, unique_first_idx, inverse = np.unique(
-            weld_keys, axis=0, return_index=True, return_inverse=True
-        )
-        verts_weld = verts[unique_first_idx].astype(np.float32, copy=False)
-        uvs_weld = uvs_out[unique_first_idx].astype(np.float32, copy=False)
-        faces_weld = inverse[faces].astype(np.int32, copy=False)
+        if weld_vertices:
+            weld_decimals = max(0, int(getattr(self.cfg, "weld_position_decimals", 6)))
+            weld_keys = np.concatenate([
+                np.round(verts, decimals=weld_decimals),
+                np.round(uvs_out, decimals=weld_decimals),
+            ], axis=1)
+            _, unique_first_idx, inverse = np.unique(
+                weld_keys, axis=0, return_index=True, return_inverse=True
+            )
+            verts_weld = verts[unique_first_idx].astype(np.float32, copy=False)
+            uvs_weld = uvs_out[unique_first_idx].astype(np.float32, copy=False)
+            faces_weld = inverse[faces_in].astype(np.int32, copy=False)
+        else:
+            verts_weld = verts.astype(np.float32, copy=False)
+            uvs_weld = uvs_out.astype(np.float32, copy=False)
+            faces_weld = faces_in.astype(np.int32, copy=False)
 
-        # Keep only non-degenerate triangles after welding.
         valid_face_mask = (
             (faces_weld[:, 0] != faces_weld[:, 1])
             & (faces_weld[:, 1] != faces_weld[:, 2])
@@ -91,6 +95,23 @@ class TextureExportMixin:
             f.write(header.encode("ascii"))
             vertex_block.tofile(f)
             face_block.tofile(f)
+
+    def _export_mesh_ply(self, path: str, texture_file: str = "optimized_texture.png"):
+        """
+        Export textured mesh as binary little-endian PLY.
+        Uses per-vertex UV properties and a TextureFile header comment.
+        """
+        verts = self.current_vertices().detach().cpu().numpy().astype(np.float32)
+        uvs = self.uvs.detach().cpu().numpy().astype(np.float32)
+        faces = self.faces.detach().cpu().numpy().astype(np.int32)
+        self._export_textured_ply(
+            path=path,
+            vertices=verts,
+            faces=faces,
+            uvs=uvs,
+            texture_file=texture_file,
+            weld_vertices=True,
+        )
 
     def _build_uv_coverage_mask(self, H: int, W: int) -> np.ndarray:
         """
@@ -223,6 +244,13 @@ class TextureExportMixin:
             os.path.join(out, "optimized_texture.png"))
         print(f"[Export] Texture  -> {out}/optimized_texture.png (sRGB-encoded)")
 
+        if bool(getattr(self, "_skybox_enabled", False)) and getattr(self, "sky_texture", None) is not None:
+            sky_np = self.sky_texture.as_image().cpu().numpy()
+            Image.fromarray((np.clip(sky_np, 0.0, 1.0) * 255).astype(np.uint8)).save(
+                os.path.join(out, "optimized_skybox_texture.png")
+            )
+            print(f"[Export] SkyTex   -> {out}/optimized_skybox_texture.png (sRGB-encoded)")
+
         # PPISP params
         with open(os.path.join(out, "ppisp_params.json"), "w") as f:
             json.dump([self.ppisp.get_params_dict(i)
@@ -233,6 +261,18 @@ class TextureExportMixin:
         mesh_ply = os.path.join(out, "optimized_mesh.ply")
         self._export_mesh_ply(mesh_ply, texture_file="optimized_texture.png")
         print(f"[Export] Mesh     -> {mesh_ply}")
+
+        if bool(getattr(self, "_skybox_enabled", False)) and getattr(self, "sky_vertices", None) is not None:
+            sky_ply = os.path.join(out, "optimized_skybox.ply")
+            self._export_textured_ply(
+                path=sky_ply,
+                vertices=self.sky_vertices.detach().cpu().numpy().astype(np.float32),
+                faces=self.sky_faces.detach().cpu().numpy().astype(np.int32),
+                uvs=self.sky_uvs.detach().cpu().numpy().astype(np.float32),
+                texture_file="optimized_skybox_texture.png",
+                weld_vertices=False,
+            )
+            print(f"[Export] Skybox   -> {sky_ply}")
 
         # Loss curve
         np.save(os.path.join(out, "loss_log.npy"),
