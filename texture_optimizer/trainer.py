@@ -741,17 +741,17 @@ class TexturePPISPTrainer(TextureExportMixin):
             "ftr": [cx + half, cy + half, cz + half],
         }
 
-        # Open-bottom skybox atlas: 5 equal-width tiles in a horizontal strip.
-        # This avoids allocating texture area to an unused ground face.
+        # Full skybox atlas: 6 faces in a 3x2 grid so every cube face is textured.
         atlas = {
-            "front":  0,
-            "right":  1,
-            "back":   2,
-            "left":   3,
-            "top":    4,
+            "front":  (0, 0),
+            "right":  (1, 0),
+            "back":   (2, 0),
+            "left":   (0, 1),
+            "top":    (1, 1),
+            "bottom": (2, 1),
         }
-        cell_w = 1.0 / 5.0
-        cell_h = 1.0
+        cell_w = 1.0 / 3.0
+        cell_h = 1.0 / 2.0
 
         faces_def = [
             ("front", ("fbl", "fbr", "ftr", "ftl")),
@@ -759,17 +759,18 @@ class TexturePPISPTrainer(TextureExportMixin):
             ("back", ("nbr", "nbl", "ntl", "ntr")),
             ("left", ("nbl", "fbl", "ftl", "ntl")),
             ("top", ("ntl", "ftl", "ftr", "ntr")),
+            ("bottom", ("nbl", "nbr", "fbr", "fbl")),
         ]
 
         verts = []
         uvs = []
         tris = []
         for name, quad in faces_def:
-            col = atlas[name]
+            col, row = atlas[name]
             u0 = col * cell_w
             u1 = (col + 1) * cell_w
-            v0 = 0.0
-            v1 = 1.0
+            v0 = row * cell_h
+            v1 = (row + 1) * cell_h
             base = len(verts)
             verts.extend([corners[k] for k in quad])
             uvs.extend([
