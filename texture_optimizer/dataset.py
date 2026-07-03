@@ -846,8 +846,12 @@ def _unwrap_mesh_xatlas(mesh: MeshData, atlas_size: int) -> MeshData:
     faces_np = mesh.faces.detach().cpu().numpy().astype(np.int32, copy=False)
     colors_np = sampled_colors.detach().cpu().numpy().astype(np.float32, copy=False)
 
-    # xatlas returns a vertex remap, reindexed face indices, and per-vertex UVs.
-    vmapping, face_indices, uvs = xatlas.parametrize(verts_np, faces_np)
+    # Use Atlas workflow so verbose progress is visible on long unwraps.
+    atlas = xatlas.Atlas()
+    atlas.add_mesh(verts_np, faces_np.astype(np.uint32, copy=False))
+    atlas.generate(verbose=True)
+    # Atlas.get_mesh returns (vertex_remap, reindexed_face_indices, per-vertex_uvs).
+    vmapping, face_indices, uvs = atlas.get_mesh(0)
 
     vmapping = np.asarray(vmapping, dtype=np.int64)
     face_indices = np.asarray(face_indices, dtype=np.int64)

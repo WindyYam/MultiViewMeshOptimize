@@ -6,8 +6,8 @@ Jointly optimises mesh texture and per-camera ISP parameters to fix
 exposure inconsistencies in COLMAP-reconstructed textured meshes.
 
 Usage:
-  python run_optimizer.py --scene /path/to/dense --mesh /path/to/mesh.ply
-  python run_optimizer.py --scene /path/to/dense --mesh mesh.obj --resume outputs/checkpoint_005000.pt
+    python run_optimizer.py --scene /path/to/dense --mesh /path/to/mesh.ply
+    python run_optimizer.py --scene /path/to/dense --mesh mesh.obj
 """
 
 import argparse
@@ -97,8 +97,7 @@ def parse_args():
                    help="PPISP gamma value (used as fixed gamma by default)")
     p.add_argument("--learn_gamma", action="store_true",
                    help="Enable per-camera PPISP gamma learning (default: fixed --ppisp_gamma)")
-    p.add_argument("--resume",      type=str,   default=None,
-                   help="Resume from checkpoint file")
+    # Removed checkpoint resume support — checkpoints are no longer stored/restored
     p.add_argument("--device",      type=str,   default=None,
                    help="cuda or cpu (auto-detected if omitted)")
     p.add_argument("--max_cameras", type=int,   default=None,
@@ -149,26 +148,22 @@ def parse_args():
                    help="Skybox texture learning rate")
     p.add_argument("--alter_every", type=int, default=0,
                    help="Alternate between texture and geometry updates every N iterations (0=disabled)")
-    p.add_argument("--topology_adapt_every", type=int, default=0,
-                   help="Run adaptive topology update every N iterations (0=disabled)")
-    p.add_argument("--topology_error_beta", type=float, default=0.9,
-                   help="EMA factor for per-face error used by topology adaptation")
-    p.add_argument("--topology_split_quantile", type=float, default=0.9,
-                   help="Split faces with error above this quantile")
-    p.add_argument("--topology_merge_quantile", type=float, default=0.2,
-                   help="Collapse faces with error below this quantile")
-    p.add_argument("--topology_max_splits", type=int, default=32768,
-                   help="Max faces to split per topology event")
-    p.add_argument("--topology_max_merges", type=int, default=32768,
-                   help="Max low-error faces used for edge-collapse per topology event")
-    p.add_argument("--topology_start_iter", type=int, default=None,
-                   help="Iteration to start topology adaptation (default: after warmups)")
-    p.add_argument("--topology_min_faces", type=int, default=128,
-                   help="Minimum face count required to run topology adaptation")
-    p.add_argument("--topology_max_faces", type=int, default=0,
-                   help="Hard cap on face count after adaptation (0=disabled)")
     p.add_argument("--backface_cull", action="store_true",
                    help="Enable backface culling during rasterization")
+    p.add_argument("--depth_peel_layers", type=int, default=1,
+                   help="Number of depth layers to render with nvdiffrast depth peeling (1 disables peeling)")
+    p.add_argument("--depth_peel_composite", type=str, default="gt_softmin",
+                   choices=["gt_softmin", "front"],
+                   help="Depth-peel compositing mode: gt_softmin (GT-aware blend) or front (first layer only)")
+    p.add_argument("--depth_peel_temperature", type=float, default=25.0,
+                   help="Softmax temperature for GT-aware depth-peel blending (higher = harder winner-take-more)")
+    p.add_argument("--depth_peel_border_only", action="store_true",
+                   help="Apply depth-peel GT-aware blending only near first-layer silhouette border")
+    p.add_argument("--no_depth_peel_border_only", action="store_false", dest="depth_peel_border_only",
+                   help="Apply depth-peel GT-aware blending to all valid pixels")
+    p.add_argument("--depth_peel_border_px", type=int, default=2,
+                   help="Border width in pixels for --depth_peel_border_only")
+    p.set_defaults(depth_peel_border_only=True)
     return p.parse_args()
 
 
@@ -274,21 +269,15 @@ def main():
     cfg.skybox_tex_res = max(16, int(args.skybox_tex_res))
     cfg.lr_skybox = float(args.lr_skybox)
     cfg.alter_every = max(0, int(args.alter_every))
-    cfg.topology_adapt_every = max(0, int(args.topology_adapt_every))
-    cfg.topology_error_beta = float(args.topology_error_beta)
-    cfg.topology_split_quantile = float(args.topology_split_quantile)
-    cfg.topology_merge_quantile = float(args.topology_merge_quantile)
-    cfg.topology_max_splits = max(0, int(args.topology_max_splits))
-    cfg.topology_max_merges = max(0, int(args.topology_max_merges))
-    cfg.topology_start_iter = args.topology_start_iter
-    cfg.topology_min_faces = max(4, int(args.topology_min_faces))
-    cfg.topology_max_faces = max(0, int(args.topology_max_faces))
     cfg.cull_backfaces = args.backface_cull
+    cfg.depth_peel_layers = max(1, int(args.depth_peel_layers))
+    cfg.depth_peel_composite = args.depth_peel_composite
+    cfg.depth_peel_temperature = float(args.depth_peel_temperature)
+    cfg.depth_peel_border_only = bool(args.depth_peel_border_only)
+    cfg.depth_peel_border_px = max(1, int(args.depth_peel_border_px))
     cfg.device          = str(device)
 
     trainer = TexturePPISPTrainer(scene, cfg)
-    if args.resume:
-        trainer.load_checkpoint(args.resume)
     trainer.train()
     trainer.export_results()
 

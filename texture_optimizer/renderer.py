@@ -110,9 +110,12 @@ class NvdiffrastRasterizer:
             return
 
         use_cuda = device.type == "cuda"
+        self._supports_depth_peeling = False
+        self._depth_peel_warned = False
         try:
             self.glctx = (dr.RasterizeCudaContext() if use_cuda
                           else dr.RasterizeGLContext())
+            self._supports_depth_peeling = use_cuda
             self.available = True
             print(f"[Renderer] nvdiffrast ready  ({'CUDA' if use_cuda else 'GL'})")
         except Exception as e:
@@ -123,10 +126,164 @@ class NvdiffrastRasterizer:
                 print("[Renderer] Trying GL fallback ...")
                 try:
                     self.glctx = dr.RasterizeGLContext()
+                    self._supports_depth_peeling = False
                     self.available = True
                     print("[Renderer] nvdiffrast ready  (GL fallback)")
                 except Exception as e2:
                     print(f"[Renderer] GL fallback failed: {e2}")
+
+    def _render_from_rast(
+        self,
+        rast: torch.Tensor,
+        rast_db: torch.Tensor,
+        faces_i32: torch.Tensor,
+        verts_clip: torch.Tensor,
+        uvs: torch.Tensor,
+        texture: TextureMap,
+        texture_tensor: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        dr = self.dr
+
+        # Interpolate UVs + screen-space derivatives for mip-mapping.
+        uv_attr = uvs.unsqueeze(0).contiguous()                   # (1,V,2)
+        texc, texc_db = dr.interpolate(uv_attr, rast, faces_i32,
+                                       rast_db=rast_db,
+                                       diff_attrs="all")          # (1,H,W,2)
+
+        # Sample texture. Keep atlas dtype when possible to reduce VRAM.
+        tex_src = texture_tensor if texture_tensor is not None else texture.tex
+        tex_hwc = tex_src.permute(0, 2, 3, 1).contiguous()
+        texc_c  = texc.to(dtype=tex_hwc.dtype).contiguous()
+        texc_db_c = texc_db.to(dtype=tex_hwc.dtype).contiguous()
+        try:
+            color = dr.texture(tex_hwc, texc_c,
+                               uv_da=texc_db_c,
+                               filter_mode="linear-mipmap-linear")
+        except Exception:
+            # Conservative fallback for driver/backend combinations that only
+            # accept float32 texture inputs.
+            tex_hwc_f32 = tex_hwc.float().contiguous()
+            texc_f32 = texc.float().contiguous()
+            try:
+                color = dr.texture(tex_hwc_f32, texc_f32,
+                                   uv_da=texc_db.float().contiguous(),
+                                   filter_mode="linear-mipmap-linear")
+            except Exception:
+                color = dr.texture(tex_hwc_f32, texc_f32, filter_mode="linear")
+
+        # Antialias edges.
+        color = dr.antialias(color, rast, verts_clip, faces_i32)  # (1,H,W,3)
+        return color.squeeze(0)                                   # (H,W,3)
+
+    def render_layers(
+        self,
+        vertices: torch.Tensor,
+        faces: torch.Tensor,
+        uvs: torch.Tensor,
+        texture: TextureMap,
+        R: torch.Tensor,
+        t: torch.Tensor,
+        K: torch.Tensor,
+        W: int,
+        H: int,
+        texture_tensor: Optional[torch.Tensor] = None,
+        num_layers: int = 1,
+        return_face_ids: bool = False,
+    ):
+        """Render one or more depth layers. Returns (colors, masks, face_ids_list_or_None)."""
+        dr = self.dr
+
+        if self.cull_backfaces:
+            faces_front = self._cull_backfaces(vertices, faces, R, t)
+            faces_i32 = faces_front.to(torch.int32).contiguous()
+        else:
+            faces_i32 = faces.to(torch.int32).contiguous()
+
+        if faces_i32.numel() == 0:
+            color = torch.zeros((H, W, 3), device=vertices.device, dtype=vertices.dtype)
+            mask = torch.zeros((H, W, 1), device=vertices.device, dtype=vertices.dtype)
+            if return_face_ids:
+                face_ids = torch.full((H, W), -1, device=vertices.device, dtype=torch.long)
+                return [color], [mask], [face_ids]
+            return [color], [mask], None
+
+        # Project once and reuse for all layers.
+        verts_clip = to_clip_space(vertices, R, t, K, W, H)      # (1,V,4)
+
+        layers = max(1, int(num_layers))
+        use_peeler = (layers > 1) and self._supports_depth_peeling
+        if (layers > 1) and (not self._supports_depth_peeling) and (not self._depth_peel_warned):
+            print("[Renderer] Depth peeling requested but unavailable in GL context. Falling back to single layer.")
+            self._depth_peel_warned = True
+
+        colors = []
+        masks = []
+        face_ids_list = [] if return_face_ids else None
+
+        if use_peeler:
+            with dr.DepthPeeler(self.glctx, verts_clip, faces_i32, resolution=[H, W]) as peeler:
+                for _ in range(layers):
+                    rast, rast_db = peeler.rasterize_next_layer()
+                    rast = rast.contiguous()
+                    rast_db = rast_db.contiguous()
+
+                    mask = (rast[..., 3:4] > 0).float().squeeze(0)
+                    if not torch.any(mask > 0.5):
+                        break
+
+                    color = self._render_from_rast(
+                        rast=rast,
+                        rast_db=rast_db,
+                        faces_i32=faces_i32,
+                        verts_clip=verts_clip,
+                        uvs=uvs,
+                        texture=texture,
+                        texture_tensor=texture_tensor,
+                    )
+                    colors.append(color)
+                    masks.append(mask)
+                    if return_face_ids:
+                        layer_face_ids = rast[..., 3].to(torch.long).squeeze(0) - 1
+                        layer_face_ids = torch.where(
+                            mask[..., 0] > 0.5,
+                            layer_face_ids,
+                            torch.full_like(layer_face_ids, -1),
+                        )
+                        face_ids_list.append(layer_face_ids)
+        else:
+            rast, rast_db = dr.rasterize(self.glctx, verts_clip, faces_i32, resolution=[H, W])
+            rast = rast.contiguous()
+            rast_db = rast_db.contiguous()
+            color = self._render_from_rast(
+                rast=rast,
+                rast_db=rast_db,
+                faces_i32=faces_i32,
+                verts_clip=verts_clip,
+                uvs=uvs,
+                texture=texture,
+                texture_tensor=texture_tensor,
+            )
+            mask = (rast[..., 3:4] > 0).float().squeeze(0)
+            colors.append(color)
+            masks.append(mask)
+            if return_face_ids:
+                layer_face_ids = rast[..., 3].to(torch.long).squeeze(0) - 1
+                layer_face_ids = torch.where(
+                    mask[..., 0] > 0.5,
+                    layer_face_ids,
+                    torch.full_like(layer_face_ids, -1),
+                )
+                face_ids_list.append(layer_face_ids)
+
+        if len(colors) == 0:
+            color = torch.zeros((H, W, 3), device=vertices.device, dtype=vertices.dtype)
+            mask = torch.zeros((H, W, 1), device=vertices.device, dtype=vertices.dtype)
+            colors = [color]
+            masks = [mask]
+            if return_face_ids:
+                face_ids_list = [torch.full((H, W), -1, device=vertices.device, dtype=torch.long)]
+
+        return colors, masks, face_ids_list
 
     @staticmethod
     def _cull_backfaces(vertices: torch.Tensor,
@@ -157,73 +314,27 @@ class NvdiffrastRasterizer:
                          return_mask: bool = False,
                          return_face_ids: bool = False):
         """Returns (H, W, 3) float32. Fully differentiable."""
-        dr = self.dr
-
-        if self.cull_backfaces:
-            faces_front = self._cull_backfaces(vertices, faces, R, t)
-            faces_i32 = faces_front.to(torch.int32).contiguous()
-        else:
-            faces_i32 = faces.to(torch.int32).contiguous()
-
-        if faces_i32.numel() == 0:
-            color = torch.zeros((H, W, 3), device=vertices.device, dtype=vertices.dtype)
-            if not return_mask and not return_face_ids:
-                return color
-            mask = torch.zeros((H, W, 1), device=vertices.device, dtype=vertices.dtype)
-            if return_face_ids:
-                face_ids = torch.full((H, W), -1, device=vertices.device, dtype=torch.long)
-                if return_mask:
-                    return color, mask, face_ids
-                return color, face_ids
-            return color, mask
-
-        # 1) Project to clip space
-        verts_clip = to_clip_space(vertices, R, t, K, W, H)      # (1,V,4)
-
-        # 2) Rasterize
-        rast, rast_db = dr.rasterize(self.glctx, verts_clip,
-                         faces_i32, resolution=[H, W])   # (1,H,W,4)
-        rast = rast.contiguous()
-        rast_db = rast_db.contiguous()
-
-        # 3) Interpolate UVs + screen-space derivatives for mip-mapping
-        uv_attr = uvs.unsqueeze(0).contiguous()                   # (1,V,2)
-        texc, texc_db = dr.interpolate(uv_attr, rast, faces_i32,
-                                       rast_db=rast_db,
-                                       diff_attrs="all")          # (1,H,W,2)
-
-        # 4) Sample texture. Keep atlas dtype when possible to reduce VRAM.
-        tex_src = texture_tensor if texture_tensor is not None else texture.tex
-        tex_hwc = tex_src.permute(0, 2, 3, 1).contiguous()
-        texc_c  = texc.to(dtype=tex_hwc.dtype).contiguous()
-        texc_db_c = texc_db.to(dtype=tex_hwc.dtype).contiguous()
-        try:
-            color = dr.texture(tex_hwc, texc_c,
-                               uv_da=texc_db_c,
-                               filter_mode="linear-mipmap-linear")
-        except Exception:
-            # Conservative fallback for driver/backend combinations that only
-            # accept float32 texture inputs.
-            tex_hwc_f32 = tex_hwc.float().contiguous()
-            texc_f32 = texc.float().contiguous()
-            try:
-                color = dr.texture(tex_hwc_f32, texc_f32,
-                                   uv_da=texc_db.float().contiguous(),
-                                   filter_mode="linear-mipmap-linear")
-            except Exception:
-                color = dr.texture(tex_hwc_f32, texc_f32, filter_mode="linear")
-
-        # 5) Antialias edges
-        color = dr.antialias(color, rast, verts_clip, faces_i32) # (1,H,W,3)
-        color = color.squeeze(0)                                   # (H,W,3)
+        colors, masks, face_ids_list = self.render_layers(
+            vertices=vertices,
+            faces=faces,
+            uvs=uvs,
+            texture=texture,
+            R=R,
+            t=t,
+            K=K,
+            W=W,
+            H=H,
+            texture_tensor=texture_tensor,
+            num_layers=1,
+            return_face_ids=return_face_ids,
+        )
+        color = colors[0]
         if not return_mask and not return_face_ids:
             return color
 
-        mask = (rast[..., 3:4] > 0).float().squeeze(0)            # (H,W,1)
+        mask = masks[0]
         if return_face_ids:
-            # nvdiffrast stores tri_id+1 in rast[...,3], 0 means background.
-            face_ids = rast[..., 3].to(torch.long).squeeze(0) - 1
-            face_ids = torch.where(mask[..., 0] > 0.5, face_ids, torch.full_like(face_ids, -1))
+            face_ids = face_ids_list[0]
             if return_mask:
                 return color, mask, face_ids
             return color, face_ids
@@ -260,3 +371,32 @@ class Rasterizer:
                                  texture_tensor=texture_tensor,
                                  return_mask=True,
                                  return_face_ids=True)
+
+    def render_layers_with_mask_and_face_ids(
+        self,
+        vertices,
+        faces,
+        uvs,
+        texture,
+        R,
+        t,
+        K,
+        W,
+        H,
+        texture_tensor=None,
+        num_layers: int = 1,
+    ):
+        return self._nvdr.render_layers(
+            vertices=vertices,
+            faces=faces,
+            uvs=uvs,
+            texture=texture,
+            R=R,
+            t=t,
+            K=K,
+            W=W,
+            H=H,
+            texture_tensor=texture_tensor,
+            num_layers=num_layers,
+            return_face_ids=True,
+        )
