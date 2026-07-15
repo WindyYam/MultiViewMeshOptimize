@@ -145,7 +145,10 @@ class NvdiffrastRasterizer:
         dr = self.dr
 
         # Interpolate UVs + screen-space derivatives for mip-mapping.
-        uv_attr = uvs.unsqueeze(0).contiguous()                   # (1,V,2)
+        uv_attr = uvs.to(dtype=torch.float32)
+        if uvs.dtype == torch.uint16:
+            uv_attr = uv_attr / 65535.0
+        uv_attr = uv_attr.unsqueeze(0).contiguous()  # (1,V,2)
         texc, texc_db = dr.interpolate(uv_attr, rast, faces_i32,
                                        rast_db=rast_db,
                                        diff_attrs="all")          # (1,H,W,2)

@@ -77,10 +77,27 @@ class CameraView:
 @dataclass
 class MeshData:
     vertices:  torch.Tensor   # (V, 3) world-space XYZ
-    faces:     torch.Tensor   # (F, 3) int64
-    uvs:       torch.Tensor   # (V, 2) UV coords in [0,1]
+    faces:     torch.Tensor   # (F, 3) int32 storage
+    uvs:       torch.Tensor   # (V, 2) UV coords in [0,1], stored as uint16 fixed-point
     face_uvs:  Optional[torch.Tensor] = None   # (F, 3, 2) per-face-vertex UV
     tex_image: Optional[torch.Tensor] = None   # (H_tex, W_tex, 3) float32 [0,1]
+
+
+UV_STORAGE_DTYPE = torch.uint16
+UV_FIXED_MAX = 65535.0
+
+
+def _to_uv_storage_dtype(uvs: torch.Tensor) -> torch.Tensor:
+    """Encode [0,1] UVs into uint16 fixed-point storage."""
+    uvs_f = uvs.to(dtype=torch.float32)
+    return torch.round(uvs_f.clamp(0.0, 1.0) * UV_FIXED_MAX).to(dtype=UV_STORAGE_DTYPE)
+
+
+def _uvs_to_float32(uvs: torch.Tensor) -> torch.Tensor:
+    """Decode UV storage dtype to float32 in [0,1] for rendering/math ops."""
+    if uvs.dtype == UV_STORAGE_DTYPE:
+        return uvs.to(dtype=torch.float32) / UV_FIXED_MAX
+    return uvs.to(dtype=torch.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -570,7 +587,7 @@ def load_ply(ply_path: str) -> MeshData:
             new_faces.append(tri)
         verts = torch.stack(new_verts)                          # (F*3, 3)
         uvs   = torch.tensor(new_uvs, dtype=torch.float32)     # (F*3, 2)
-        faces = torch.tensor(new_faces, dtype=torch.int64)     # (F, 3)
+        faces = torch.tensor(new_faces, dtype=torch.int32)     # (F, 3)
 
     # --- Layout B: per-vertex UV properties ---
     else:
@@ -592,7 +609,7 @@ def load_ply(ply_path: str) -> MeshData:
             v_c = 0.5 - torch.asin(v[:,1].clamp(-1,1)) / math.pi
             uvs = torch.stack([u_c, v_c], dim=1)
         verts = base_verts
-        faces = torch.tensor(face_lists, dtype=torch.int64) if face_lists                 else torch.zeros((0,3), dtype=torch.int64)
+        faces = torch.tensor(face_lists, dtype=torch.int32) if face_lists                 else torch.zeros((0,3), dtype=torch.int32)
 
     if not face_lists:
         print("[load_ply]   WARNING: No faces — PLY is a point cloud")
@@ -615,7 +632,7 @@ def load_ply(ply_path: str) -> MeshData:
         tex_image = _bake_vertex_colors_to_texture(verts, faces, uvs, vert_colors)
 
     print(f"[load_ply]   {verts.shape[0]} verts, {faces.shape[0]} faces")
-    return MeshData(vertices=verts, faces=faces, uvs=uvs, tex_image=tex_image)
+    return MeshData(vertices=verts, faces=faces, uvs=_to_uv_storage_dtype(uvs), tex_image=tex_image)
 
 
 def _bake_vertex_colors_to_texture(
@@ -631,7 +648,7 @@ def _bake_vertex_colors_to_texture(
     Used to initialise the texture from a vertex-coloured PLY.
     """
     # Vectorized splat of all face-vertex colors into UV texel bins.
-    uv_px = uvs.clone()
+    uv_px = _uvs_to_float32(uvs)
     uv_px[:, 0] = uv_px[:, 0] * (res - 1)
     # Internal UVs use image-space convention (V=0 at top), so map directly.
     uv_px[:, 1] = uv_px[:, 1] * (res - 1)
@@ -746,7 +763,7 @@ def load_obj(obj_path: str) -> MeshData:
     verts_t = torch.tensor(new_verts, dtype=torch.float32)
     uvs_t   = torch.tensor(new_uvs,   dtype=torch.float32)
     uvs_t[:, 1] = 1.0 - uvs_t[:, 1]   # OBJ V=0 is bottom; flip to top-left origin
-    faces_t = torch.tensor(new_faces, dtype=torch.int64)
+    faces_t = torch.tensor(new_faces, dtype=torch.int32)
 
     # Load initial texture
     tex_image = None
@@ -760,7 +777,7 @@ def load_obj(obj_path: str) -> MeshData:
     return MeshData(
         vertices=verts_t,
         faces=faces_t,
-        uvs=uvs_t,
+        uvs=_to_uv_storage_dtype(uvs_t),
         tex_image=tex_image,
     )
 
@@ -807,7 +824,7 @@ def _sample_texture_at_uvs(tex_image: torch.Tensor, uvs: torch.Tensor) -> torch.
         raise ValueError("UV tensor must have shape (V, 2)")
 
     tex = tex_image.permute(2, 0, 1).unsqueeze(0).float()  # (1,3,H,W)
-    grid = uvs.float() * 2.0 - 1.0
+    grid = _uvs_to_float32(uvs) * 2.0 - 1.0
     # Internal UVs are top-origin, matching grid_sample image coordinates.
     grid = grid.view(1, 1, -1, 2)  # (1,1,V,2)
     sampled = F.grid_sample(
@@ -871,7 +888,7 @@ def _unwrap_mesh_xatlas(mesh: MeshData, atlas_size: int) -> MeshData:
     new_verts_t = torch.from_numpy(new_verts_np.astype(np.float32, copy=False))
     new_uvs_t = torch.from_numpy(new_uvs_np.astype(np.float32, copy=False))
     new_cols_t = torch.from_numpy(new_cols_np.astype(np.float32, copy=False))
-    new_faces_t = torch.from_numpy(face_indices.astype(np.int64, copy=False))
+    new_faces_t = torch.from_numpy(face_indices.astype(np.int32, copy=False))
 
     tex_image = _bake_vertex_colors_to_texture(
         verts=new_verts_t,
@@ -888,7 +905,7 @@ def _unwrap_mesh_xatlas(mesh: MeshData, atlas_size: int) -> MeshData:
     return MeshData(
         vertices=new_verts_t,
         faces=new_faces_t,
-        uvs=new_uvs_t,
+        uvs=_to_uv_storage_dtype(new_uvs_t),
         tex_image=tex_image,
     )
 
@@ -1047,7 +1064,7 @@ def make_synthetic_scene(
         [ 1,  1, 0],
         [-1,  1, 0],
     ], dtype=torch.float32)
-    faces = torch.tensor([[0,1,2],[0,2,3]], dtype=torch.int64)
+    faces = torch.tensor([[0,1,2],[0,2,3]], dtype=torch.int32)
     uvs_per_vert = torch.tensor([
         [0,0],[1,0],[1,1],[0,1]
     ], dtype=torch.float32)
@@ -1064,8 +1081,8 @@ def make_synthetic_scene(
 
     mesh = MeshData(
         vertices=torch.stack(new_v),
-        faces=torch.tensor(new_f, dtype=torch.int64),
-        uvs=torch.stack(new_uv),
+        faces=torch.tensor(new_f, dtype=torch.int32),
+        uvs=_to_uv_storage_dtype(torch.stack(new_uv)),
         tex_image=None,
     )
 

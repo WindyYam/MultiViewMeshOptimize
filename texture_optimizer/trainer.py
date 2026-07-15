@@ -323,7 +323,7 @@ class TexturePPISPTrainer(TextureExportMixin):
 
         # ---- Mesh ----
         self.base_vertices = scene.mesh.vertices.to(self.device)
-        self.faces    = scene.mesh.faces.to(self.device)
+        self.faces    = scene.mesh.faces.to(self.device, dtype=torch.int32)
         self.uvs      = scene.mesh.uvs.to(self.device)
         self._geometry_dtype = self._resolve_geometry_dtype(config.geometry_dtype)
 
@@ -1284,7 +1284,7 @@ class TexturePPISPTrainer(TextureExportMixin):
         e20 = faces[:, [2, 0]]
         edges = torch.cat([e01, e12, e20], dim=0)
         edges = torch.sort(edges, dim=1).values
-        return torch.unique(edges, dim=0)
+        return torch.unique(edges, dim=0).to(torch.long)
 
     def _build_face_adjacency(self, faces: torch.Tensor, vertex_groups: Optional[torch.Tensor] = None):
         """
@@ -1378,7 +1378,7 @@ class TexturePPISPTrainer(TextureExportMixin):
 
     def _set_topology(self, vertices: torch.Tensor, faces: torch.Tensor, uvs: torch.Tensor):
         self.base_vertices = vertices.to(self.device)
-        self.faces = faces.to(self.device)
+        self.faces = faces.to(self.device, dtype=torch.int32)
         self.uvs = uvs.to(self.device)
 
         self._weld_index = None

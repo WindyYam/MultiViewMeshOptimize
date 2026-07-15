@@ -142,9 +142,10 @@ def compute_face_normals_and_double_area(
     vertices: torch.Tensor,
     faces: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    v0 = vertices[faces[:, 0]]
-    v1 = vertices[faces[:, 1]]
-    v2 = vertices[faces[:, 2]]
+    faces_idx = faces.to(torch.long)
+    v0 = vertices[faces_idx[:, 0]]
+    v1 = vertices[faces_idx[:, 1]]
+    v2 = vertices[faces_idx[:, 2]]
     n_raw = torch.cross(v1 - v0, v2 - v0, dim=1)
     a2 = n_raw.norm(dim=1).clamp(min=1e-12)
     n_unit = n_raw / a2.unsqueeze(1)
@@ -195,9 +196,10 @@ def _geometry_face_edge_uniform_loss(
     if faces is None or faces.numel() == 0:
         return torch.zeros((), device=vertices.device, dtype=vertices.dtype)
 
-    v0 = vertices[faces[:, 0]]
-    v1 = vertices[faces[:, 1]]
-    v2 = vertices[faces[:, 2]]
+    faces_idx = faces.to(torch.long)
+    v0 = vertices[faces_idx[:, 0]]
+    v1 = vertices[faces_idx[:, 1]]
+    v2 = vertices[faces_idx[:, 2]]
 
     l01 = (v0 - v1).norm(dim=1)
     l12 = (v1 - v2).norm(dim=1)
