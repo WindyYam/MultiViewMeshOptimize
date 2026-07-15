@@ -2,18 +2,10 @@ import os
 import json
 
 import numpy as np
-import torch
 from PIL import Image, ImageDraw
 
 
 class TextureExportMixin:
-
-    @staticmethod
-    def _decode_uvs_for_export(uvs_t: torch.Tensor) -> np.ndarray:
-        uvs_f = uvs_t.detach().to(torch.float32)
-        if uvs_t.dtype == torch.uint16:
-            uvs_f = uvs_f / 65535.0
-        return uvs_f.cpu().numpy().astype(np.float32, copy=False)
 
     def _export_textured_ply(
         self,
@@ -110,7 +102,7 @@ class TextureExportMixin:
         Uses per-vertex UV properties and a TextureFile header comment.
         """
         verts = self.current_vertices().detach().cpu().numpy().astype(np.float32)
-        uvs = self._decode_uvs_for_export(self.uvs)
+        uvs = self.uvs.detach().cpu().numpy().astype(np.float32)
         faces = self.faces.detach().cpu().numpy().astype(np.int32)
         self._export_textured_ply(
             path=path,
@@ -128,7 +120,7 @@ class TextureExportMixin:
         mask_img = Image.new("L", (W, H), 0)
         drawer = ImageDraw.Draw(mask_img)
 
-        uvs = self._decode_uvs_for_export(self.uvs)
+        uvs = self.uvs.detach().cpu().numpy().astype(np.float32)
         faces = self.faces.detach().cpu().numpy().astype(np.int64)
 
         xs = np.clip(uvs[:, 0], 0.0, 1.0) * float(W - 1)
