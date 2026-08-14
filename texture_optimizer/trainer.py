@@ -1,5 +1,5 @@
 """
-Texture + Per-Camera PPISP Joint Optimiser
+Multi-View Differentiable Mesh Optimize
 
 Training loop:
     - Random camera sampling each iteration (like 3DGS)

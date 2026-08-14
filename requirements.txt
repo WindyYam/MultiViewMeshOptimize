@@ -1,0 +1,23 @@
+# Core optimiser and image/array handling
+# For NVIDIA GPU training, install the CUDA-compatible PyTorch build first.
+torch>=2.0
+numpy>=1.24
+Pillow>=9.0
+matplotlib>=3.7
+
+# Differentiable rendering and mesh preparation
+nvdiffrast>=0.3.3
+xatlas>=0.0.9
+
+# COLMAP binary loading and optional SSIM backend
+pycolmap>=3.9
+pytorch-msssim>=1.0
+
+# Live OpenCV preview
+opencv-python>=4.8
+
+# Optional OpenGL viewer (view_model.py / viewer/)
+glfw>=2.7
+imgui>=2.0
+moderngl>=5.8
+plyfile>=1.0

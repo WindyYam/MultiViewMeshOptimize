@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Texture + Per-Camera PPISP Optimiser
+Multi-View Differentiable Mesh Optimize
 =====================================
 Jointly optimises mesh texture and per-camera ISP parameters to fix
 exposure inconsistencies in COLMAP-reconstructed textured meshes.
@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Texture + PPISP joint optimiser")
+    p = argparse.ArgumentParser(description="Multi-view differentiable mesh optimizer")
     p.add_argument("--scene",       type=str,   default=None,
                    help="Path to COLMAP scene root (contains sparse/ and images/)")
     p.add_argument("--mesh",        type=str,   default=None,
