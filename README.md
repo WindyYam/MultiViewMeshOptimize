@@ -1,9 +1,11 @@
 # Multi-View Differentiable Mesh Optimize
 
 Optimises a COLMAP mesh texture and per-camera colour/exposure corrections.
-Optional geometry offsets can be enabled with `--learn_geometry`. Camera poses
-and intrinsics remain fixed. Training uses differentiable nvdiffrast rendering
-and compares each render with its source photograph.
+PPISP models per-camera exposure differences so they do not bias the mesh and
+texture optimization. Optional geometry offsets can be enabled with
+`--learn_geometry`. Camera poses and intrinsics remain fixed. Training uses
+differentiable nvdiffrast rendering and compares each render with its source
+photograph.
 
 ## Example comparison
 
@@ -12,6 +14,27 @@ texture-optimized result, and the textured mesh exported directly
 from COLMAP.
 
 https://github.com/user-attachments/assets/7e48be0b-c135-4edf-8654-e6a66529d14c
+
+## Comparison screenshots
+Below are screenshots before and after the optimization on the scene "drjohnson"
+<table>
+    <tr>
+        <td><img src="assets/compare/Screenshot%202026-08-14%20141027.png" alt="Comparison screenshot 1"></td>
+        <td><img src="assets/compare/Screenshot%202026-08-14%20141057.png" alt="Comparison screenshot 2"></td>
+    </tr>
+    <tr>
+        <td><img src="assets/compare/Screenshot%202026-08-14%20141136.png" alt="Comparison screenshot 3"></td>
+        <td><img src="assets/compare/Screenshot%202026-08-14%20141148.png" alt="Comparison screenshot 4"></td>
+    </tr>
+    <tr>
+        <td><img src="assets/compare/Screenshot%202026-08-14%20141231.png" alt="Comparison screenshot 5"></td>
+        <td><img src="assets/compare/Screenshot%202026-08-14%20141241.png" alt="Comparison screenshot 6"></td>
+    </tr>
+    <tr>
+        <td><img src="assets/compare/Screenshot%202026-08-14%20141348.png" alt="Comparison screenshot 7"></td>
+        <td><img src="assets/compare/Screenshot%202026-08-14%20141359.png" alt="Comparison screenshot 8"></td>
+    </tr>
+</table>
 
 ## Dependencies
 
