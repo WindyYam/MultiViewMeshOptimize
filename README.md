@@ -86,6 +86,7 @@ python .\run_optimizer.py `
     --tex_res 8192 `
     --uv_unwrap `
     --learn_geometry
+	--live_view
 ```
 
 The scene should contain source images in `scene_root/images/`. COLMAP files
@@ -95,11 +96,6 @@ current working directory), or placed as a `.ply` or `.obj` file under
 `scene_root/mesh/` for automatic discovery. `--uv_unwrap` requires `xatlas`.
 For best results, the coarse input mesh should include vertex colours or a
 coarse texture atlas so texture optimization has a useful initialization.
-
-## Optional live scene view
-
-Append `--live_view` to the command to open an interactive OpenCV preview while
-training. Use `--live_view_every N` to change the refresh interval.
 
 ## Outputs
 
