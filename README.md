@@ -38,6 +38,15 @@ Below are screenshots before and after the optimization on the scene "drjohnson"
 
 ## Dependencies
 
+Create and activate a virtual environment from the `meshOptimize` directory:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+Use this activated environment for all subsequent commands in this README.
+
 With the virtual environment activated, first install the PyTorch build with
 CUDA support that matches your NVIDIA driver and CUDA platform. Do not install
 the CPU-only PyTorch version. Use the official download page to select the
@@ -53,14 +62,27 @@ python -m pip install -r requirements.txt
 
 ## Start
 
-Run from the `meshOptimize` directory and replace the placeholder paths:
+Optionally, if your COLMAP reconstruction uses distorted images, undistort
+them before optimization so the images and camera model match:
+
+```powershell
+colmap image_undistorter `
+    --image_path C:\path\to\colmap_scene\images `
+    --input_path C:\path\to\colmap_scene\sparse\0 `
+    --output_path C:\path\to\undistorted_scene `
+    --output_type COLMAP
+```
+
+If you run this step, set `--scene` to the `--output_path` directory created
+above. Otherwise, use the original COLMAP scene. Run from the `meshOptimize`
+directory and replace the placeholder paths:
 
 ```powershell
 python .\run_optimizer.py `
     --scene C:\path\to\colmap_scene `
     --mesh C:\path\to\mesh.ply `
     --output C:\path\to\optimized `
-    --iters 20000 `
+    --iters 10000 `
     --tex_res 8192 `
     --uv_unwrap `
     --learn_geometry

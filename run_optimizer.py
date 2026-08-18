@@ -124,7 +124,7 @@ def parse_args():
                    help="GradScaler growth interval for fp16 AMP")
     p.add_argument("--no_tf32", action="store_true",
                    help="Disable TF32 matmul/conv acceleration on CUDA")
-    p.add_argument("--image_cpu_cache_size", type=int, default=32,
+    p.add_argument("--image_cpu_cache_size", type=int, default=8,
                    help="Number of GT images kept in CPU RAM cache")
     p.add_argument("--image_gpu_cache_size", type=int, default=4,
                    help="Number of GT images prefetched to GPU cache")
